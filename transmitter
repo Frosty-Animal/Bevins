@@ -1,0 +1,693 @@
+/*
+ * TO DO
+ * 2015-10-20 - write versions of code for EMC testing.
+ * --- irq 2ms after no RX. so can process RX ASAP
+ * --- have packet ready for TX to minimize delay.
+ * --- increase packet exchange rate to highest speed with no missed packets. (max is 12 * 16ms for 2way comm and no missed packets
+ * DONE-- RCVR verison that changes channel every minute. XMTR will channel search and link.
+ *      This will utilize the complete ISM 2.4GHz bandwidth.
+ * DONE-- RCVR version that simulate the motor FWD 24 sec ramp up then down. then reverse 24 second ramp up then down
+ * DONE-- XMTR no rf version
+ * --- RCVR no rf version . need to modify Proflex board to allow /reset line to be controlled from the RCVR processor (change R30 and R40 to 0 ohm on Proflex board)
+ *
+ * ? RCVR listens at startup to see if a linked pair is using its startup channel.
+ *    if so then it increments channel by 2, checks again and stays if not in use
+ *     by linked set.
+ *
+ * Operation:
+ * RCVR uses the last nibble of its MAC ID (0-F) to select which channel it starts on.
+ *  There are 15 channels available in the Proflex radio design 11-25.
+ *  The channel to use is derived by 10 + 0-15. if the sum is 10 the it gets
+ *   incremented by 1.
+ *  The receiver then listens on that channel to determine if there is already
+ *   a linked RG set using it. if so it increments its channel by 2 (wraps around)
+ *   and waits for a XMTR to link it.
+ *  All RCVR's start up at address C0DE. when a link request is received then it changes
+ *   its address to the reversed byt version of the XMTR that is linking with it.
+ * XMTR Starts on channel 11 and starts sending link requests to address C0DE.
+ *  When a link response comes from a RCVR the XMTR links and sends only to the RCVRs address.
+ *  If the CMTR gets no response for 1 second then it starts seeking available RCVR's again.
+ *
+ *
+ *
+ * File:   RGXMTR-PF-2main.c
+ * Author: Phil Hagan
+ *
+ * MW Bevins Ratchet Gun : Transmitter PCB
+ * 2 way communication using the LSR PROFLEX01-R2 transciever.
+ * 
+ * Created on March 18, 2015
+ * 2015-09-28 : Started rewrite of auto adressing version
+ *
+ * Compiler:  MPLAB-X XC8 V1.30 (free mode)
+ * Description:
+ * Processor: PIC16LF1509EML
+ * Pin Assignments:
+ *  1   ~MCLR/Vpp/RA3     I ~MCLR
+ *  2   RC5               O PWM1-LED1-GREEN
+ *  3   RC4               I NU
+ *  4   RC3               O PWM2-LED2-BLUE
+ *  5   RC6               O EXT_nRESET
+ *  6   RC7               O GPIO1
+ *  7   RB7               O TX
+ *  8   RB6               O RTS
+ *  9   RB5               I RX
+ * 10   RB4               I CTS
+ * 11   RC2               I selector
+ * 12   RC1               I selector
+ * 13   RC0               I selector
+ * 14   RA2               A AN2-FWD/REV -potentiometer
+ * 15   RA1/ICSPCLK       I ICSPCLK
+ * 16   RA0/ICSPDAT       I ICSPDAT
+ * 17   Vss                 GND
+ * 18   VDD                 +3.3V
+ * 19   RA5               I not used
+ * 20   RA4               A Battery voltage
+ *
+*/
+
+#include <xc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "hostcom.h"
+
+//function declarations
+void initUART(void);
+void InitRegs(void);
+
+#pragma config BOREN = OFF, FOSC = INTOSC, MCLRE = OFF, WDTE = 0x01, CP = OFF, PWRTE = OFF, CLKOUTEN = OFF
+#pragma config LPBOR = OFF, WRT = OFF, STVREN = OFF, BORV = LO, LVP = OFF
+#pragma config IDLOC0 = 0x7F; //0x8000
+#pragma config IDLOC1 = 0x7F; //0x8001
+#pragma config IDLOC2 = 0x7F; //0x8002
+#pragma config IDLOC3 = 0x7F; //0x8003
+
+//#define LED1 0x20 // RC5 - LED1
+//#define LED2 0x08 // RC3 - LED2
+
+//======================================================================================================
+//DEFINES DEFINES DEFINES DEFINES DEFINES DEFINES DEFINES DEFINE DEFINES DEFINES DEFINES DEFINES DEFINES
+#define SLEEPFUNCTION 1 
+#define DISABLE_RF 0
+#define EMCTEST_TX70 0
+#define NORMAL_RF_TX 0 //Normal operation if set, Reset to 0 to disable RF TX for EMC testing.
+//DEFINES DEFINES DEFINES DEFINES DEFINES DEFINES DEFINES DEFINE DEFINES DEFINES DEFINES DEFINES DEFINES
+//======================================================================================================
+
+
+// constants
+
+
+// variables
+#if SLEEPFUNCTION
+#define SLEEPSECTIMOUT 1815 //=30min 1815
+unsigned short sleepsectimer = 0;
+unsigned char sleep16mstimer = 0;
+#endif
+
+#define DEFAULT_BAUDRATE 4
+#define PREFERRED_BAUDRATE 7
+unsigned char BaudRate = PREFERRED_BAUDRATE; //4=19200, 5=38400, 6=57600, 7=115200
+
+short newidc; //intantanious duty cycle - neg is reverse and pos is forward
+short adcresult;
+unsigned char comgoodtimer = 0;
+unsigned short uppstatus = 0;
+
+// thumb controlled 60 degree potentiometer.
+//   REVERSE    DETENT     FORWARD
+//100%-------0 0 0 0 0 0 0--------100%   duty cycle value , reverse and forward
+//0-------------------------------1023   pot value
+// need to make 512-x to 512+x be off and 512-x to 44 = reverse 0-100dc and 512+x to 980 = forward 0-100dc
+//#define HLO 412 //512 - 100
+//#define HHI 612 //512 + 100
+//float hsf = 0.278; //scale 0-HLO or HHI-1023 to 100 ; take piezo pot end point offset 44 into account
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//#define HLO 462 //512 - 50
+//#define HHI 562 //512 + 50
+//float hsf = 0.23; //scale 0-HLO or HHI-1023 to 100
+
+#define HLO 411 //512 - 50
+#define HHI 511 //512 + 50
+float hsf = 0.62; //scale 0-HLO or HHI-1023 to 100
+float hhsf = 0.74;
+
+short potval; // value of potentiometer 0-1023;
+short dutycycle = 0;
+short ducy = 0;
+short sdc; //signed duty cycle - neg is reverse and pos is forward
+short batteryvoltage;
+
+unsigned char direction;
+
+#define BATTERYCHECKTIME 186 //3 seconds //6250 //6250=100seconds
+unsigned short batterychecktimer = 0;
+
+short adcbattery;
+#define BATEND 50 //5.0V  - replace
+#define RBATEND 100 //10.0V replace (RCVR battery)
+unsigned char batend = 50;
+float batsf = 2.55; // 102/(90-50)
+unsigned char batteryleddutycycle; //bldc
+unsigned char pbldc; //previous bldc
+short rcvrbatteryvoltage = 0;
+//unsigned char batchkcnt = 0; //battery check counter
+
+unsigned char state = 0; //RG-XMTR operation state see S_ defines
+
+#if SLEEPFUNCTION
+//#define S_SLEEP         0
+#endif
+
+#define S_WAKE          1
+#define S_NORMAL_RUN    2
+#define S_LISTEN        3
+#define S_SHUTDOWN      9
+
+unsigned short batterycounter = 384; //~6seconds
+#define RFACTIVECOUNT 64 // x*0.016s, 128=2seconds, 64=1sec,
+unsigned char rfactive = 0; // set to RFACTIVECOUNT when good packet received. counts down on timed bases when no packet received.
+                            // Allows for RFACTIVECOUNT missed packets.
+
+// RF constants,variable, code
+#define RFCHANNEL_INIT 11;
+unsigned char rfchannel = RFCHANNEL_INIT; //11=2405MHz, 12=2410MHz,... 26=2480MHz
+unsigned char TCVRshortaddr[2] = {0,0}; //2byte unique RG XMTR identifier.
+unsigned char TCVRlongaddr[8] = {0,0,0,0,0,0,0,0}; //8byte unique RG XMTR identifier.
+unsigned char pan_id[2];// = {0xCE,0xFA};
+
+#define POWMAXLOWEND 12
+#define POWMAX 12
+#define POWMAXHIGHEND 12
+unsigned char transmitpowerlevel = POWMAX; // 0-19
+
+unsigned char RGtype = 'X'; //X=XMTR, R=RCVR
+unsigned char inSOURCEaddress[2];
+unsigned char inDESTaddress[2];
+unsigned char outDESTaddress[2];
+unsigned char LinkedRCVRaddr[2];
+unsigned char linked = 0;
+unsigned char rxpacket[10];
+volatile unsigned char uartdelaytimer = 0;
+//volatile unsigned char rxtslb;
+#define XMITPERIOD 8 //12 //12
+unsigned char xmitcnt = 0; //counts up every timer0 irq - used as transmit timer
+#define CHANNELPERIOD 36;
+unsigned char channelgoodtimer;
+
+void CheckBattery(void) {
+    ADCON0 = 0x0C; // AN3 on RA4 pin 20 - battery voltage, ADC off
+    ADCON0 |= 0x01; // ADON
+    ADCON0 |= 0x02; // start next conversion
+    while (ADCON0 & 0x02) {} //wait for conversion to finish
+    adcresult = (short)(ADRESH << 8) + (short)ADRESL;
+    ADCON0 = 0;
+    //adcresult &= 1023; // 0-1023
+    adcbattery = adcresult;
+    batteryvoltage = (short)((float)adcbattery/(float)6.95); //ie 90 = 9.0
+    if (batterycounter>0) { //use local battery level to drive led pwm
+        batend = BATEND;
+        if (batteryvoltage<=batend) batteryleddutycycle = 5;
+        if ((batteryvoltage>batend) && (batteryvoltage<90)) {
+            batteryleddutycycle = (unsigned char)((float)(batteryvoltage-batend) * batsf);
+            if (batteryleddutycycle>102) batteryleddutycycle = 102;
+        }
+        if (batteryvoltage>=90) batteryleddutycycle = 102;
+    }
+    else { //use remote RCVR to drive level to drive led pwm
+        batend = RBATEND;
+        if (rcvrbatteryvoltage<=batend) batteryleddutycycle = 5;
+        if ((rcvrbatteryvoltage>batend) && (rcvrbatteryvoltage<90)) {
+            batteryleddutycycle = (unsigned char)((float)(rcvrbatteryvoltage-batend) * batsf);
+            if (batteryleddutycycle>102) batteryleddutycycle = 102;
+        }
+    }
+
+    if (pbldc != batteryleddutycycle) {
+        PWM1DCH = batteryleddutycycle;
+        pbldc = batteryleddutycycle;
+    }
+    batterychecktimer = BATTERYCHECKTIME;
+}
+
+void CheckPot(void)
+{
+    //get potentiometer voltage
+    ADCON0 = 0x08; // AN2 on RA2 pin 11 - motor dir/speed potentiometer, ADC off
+    ADCON0 |= 0x01; // ADON
+    ADCON0 |= 0x02; // start next conversion
+    while (ADCON0 & 0x02) {} //wait for conversion to finish
+    ADCON0 = 0;
+    adcresult = (int)(ADRESH << 8) + (int)ADRESL;
+    adcresult &= 1023; // 0-1023
+    potval = adcresult;
+    // update dutycycle and direction
+    if ((potval>=HLO) && (potval<=HHI)) dutycycle = 0; //center detent zone
+    if (potval<HLO) {
+        dutycycle = HLO-potval; //reverse
+        dutycycle = (short)((float)dutycycle * hsf);
+    }
+    if (potval>HHI) {
+        dutycycle = potval-(short)HHI; // forward
+        dutycycle = (short)((float)dutycycle * hhsf);
+    }
+    if (dutycycle<0) dutycycle = 0;
+    if (dutycycle>102) dutycycle = 102;
+    di();                   //disable GIE
+    ducy = dutycycle;
+    ei();                   //enable GIE
+    if (potval<HLO) direction = 255; //reverse
+    if (potval>HHI) direction = 0;  //forward
+    sdc = ducy;
+    if (direction==255) sdc = sdc * (short)-1;
+    if (sdc) {
+#if SLEEPFUNCTION
+        sleep16mstimer = 0;
+        sleepsectimer = 0;
+#endif
+    }
+}
+
+void errStop(unsigned char errornumber) {
+    //flash led to indicate errornumber
+    //1 = did not get a response for query of basic rf parameters.
+    //2 = indicates that Proflex radio needs its MAC address rewritten
+    //flashled = 0;
+    while (1) { //stay in loop
+        comgoodtimer = 100;
+        PWM2OE = 0; //led off
+        uartdelaytimer = 64;
+        while (uartdelaytimer) {};
+        for (int i=0;i<errornumber; i++) {
+            PWM2DCH = 70;
+        comgoodtimer = 100;
+            PWM2OE = 1;
+            uartdelaytimer = 32;
+            while (uartdelaytimer) {};
+        comgoodtimer = 100;
+            PWM2OE = 0;
+            uartdelaytimer = 32;
+            while (uartdelaytimer) {};
+        }
+    }
+}
+
+void initRF(void) {
+
+    // initialize RF module
+    // check long address to see if it is the same as physically written on radio.
+    // set short address to last 2 words of long address.
+
+    PWM2DCH = 0;
+    comgoodtimer = 0;
+    PWM2OE = 0;
+
+
+    uartdelaytimer = 32;
+    while (uartdelaytimer) {};
+    //assume baud rate is the default 19200 and set to preferred baudrate
+    BaudRate = DEFAULT_BAUDRATE;
+    initUART();
+    BaudRate = PREFERRED_BAUDRATE;
+    sendRFmessage(SET_HOST_DATA_RATE_18); //change to new rate
+    uppstatus = uartprocesspacket(4);
+    initUART();
+
+
+    uartdelaytimer = 32;
+    while (uartdelaytimer) {};
+
+    //read current settings
+    sendRFmessage(QUERY_BASIC_RF_SETTINGS_11);
+    uppstatus = uartprocesspacket(2);
+    if (uppstatus != 0x9101) {
+        sendRFmessage(QUERY_BASIC_RF_SETTINGS_11);
+        uppstatus = uartprocesspacket(2);
+    }
+    if (uppstatus == 0x9101) { //query basic RF settings response
+
+        //first 4 words of MAC address(long) are allways the same for the Proflex module.
+        if ((TCVRlongaddr[7]==0x00) && (TCVRlongaddr[6]==0x25) && (TCVRlongaddr[5]==0xCA) && (TCVRlongaddr[4]==0x02)) {
+            //long address is the mac address printed on proflex module.
+        }
+        else {
+            errStop(2); //indicates that Proflex radio needs its MAC address rewritten. probably got changed during early version of RG code.
+            
+            TCVRlongaddr[7] = 0x00;
+            TCVRlongaddr[6] = 0x25;
+            TCVRlongaddr[5] = 0xCA;
+            TCVRlongaddr[4] = 0x02;
+            TCVRlongaddr[3] = 0x00;
+            TCVRlongaddr[2] = 0x05;
+            TCVRlongaddr[1] = 0x28;
+            TCVRlongaddr[0] = 0xDC;
+        }
+        //original MAC address is saved in radio. use low 16bits as shortaddress
+        TCVRshortaddr[0] = TCVRlongaddr[0];
+        TCVRshortaddr[1] = TCVRlongaddr[1];
+        outDESTaddress[0] = TCVRshortaddr[1]; //if was linked and RCV is still powered. after 3 second timeout it will switch to C0DE to find just powered RCVR
+        outDESTaddress[1] = TCVRshortaddr[0];
+        rfchannel = RFCHANNEL_INIT;
+#if EMCTEST_TX70
+        rfchannel = 18; //use channel in the middle of the spectrum
+#endif
+        pan_id[0] = 0xCE;
+        pan_id[1] = 0xFA;
+        transmitpowerlevel = POWMAX; // 0-19
+        if (rfchannel<14) transmitpowerlevel = POWMAXLOWEND; // 0-19
+        if (rfchannel>24) transmitpowerlevel = POWMAXHIGHEND; // 0-19
+
+        sendRFmessage(SET_BASIC_RF_SETTINGS_10);
+        uppstatus = uartprocesspacket(2);
+        sendRFmessage(SAVE_SETTINGS_TO_NON_VOLATILE_MEMORY_12);
+        uppstatus = uartprocesspacket(2);
+    }
+    else errStop(1); //no response to query basic RF settings
+}
+
+void main(void) {
+    InitRegs();
+
+#if SLEEPFUNCTION
+    sleep16mstimer = 0;
+    sleepsectimer = 0;
+#endif
+
+    initRF();
+
+    CheckBattery();
+
+#if EMCTEST_TX70
+    while(1) {
+PORTAbits.RA0 = 1;
+        sendRFmessage(SEND_SIMPLE_SHORT_ADDRESSING_RF_DATA_PACKET_20);
+PORTAbits.RA0 = 0;
+        CLRWDT();
+    }
+#endif
+
+    state = S_WAKE;
+
+    while (1) {
+
+        CLRWDT();
+
+#if SLEEPFUNCTION
+        if ( sleepsectimer>SLEEPSECTIMOUT) {
+            TMR0IE = 0; // disable timer0 interrupt
+            TMR0IF = 0;
+            PWM1CON = 0;
+            PWM2CON = 0;
+            //PORTC = 0;
+
+            SLEEP();
+            NOP();
+            state = S_WAKE;
+            sleep16mstimer = 0;
+            sleepsectimer = 0;
+        }
+#endif
+
+        if (state == S_WAKE) {
+
+            LinkedRCVRaddr[0] = 0;
+            LinkedRCVRaddr[1] = 0;
+            linked = 0;
+            inSOURCEaddress[0] = 0;
+            inSOURCEaddress[1] = 0;
+            inDESTaddress[0] = 0;
+            inDESTaddress[1] = 0;
+            state = S_NORMAL_RUN;
+            //flashled = 0;
+            rfactive = RFACTIVECOUNT;
+            TMR0IF = 0;
+            TMR0IE = 1;        // enable timer0 interrupt
+            xmitcnt =  XMITPERIOD + (TCVRlongaddr[0] & 0x0F); //use MAC byte to randomize the xmit time. set it again if link is lost.  random = 0=63 so it can be used to force a transmit on a spcific time 0-63rd 16ms tick
+
+        }
+
+        if (state == S_NORMAL_RUN) {
+            if (batterychecktimer==0) CheckBattery();
+
+            CheckPot();
+
+            uppstatus = uartprocesspacket(0);
+            if (uppstatus == 0xA1F1) { //receive
+                if ((rxpacket[0]=='M') && (rxpacket[1]=='W') && (rxpacket[2]=='B') && (rxpacket[3]=='R') && (rxpacket[4]=='G') && (rxpacket[5]=='R')) {
+                    rcvrbatteryvoltage = newidc;
+                    comgoodtimer = XMITPERIOD;
+                    PWM2DCH = 5;
+                    PWM2OE = 1; //
+                    outDESTaddress[0] = inSOURCEaddress[0];
+                    outDESTaddress[1] = inSOURCEaddress[1];
+                    rfactive = RFACTIVECOUNT;
+                    channelgoodtimer = CHANNELPERIOD;
+                }
+            }
+
+            if (xmitcnt==0) { //every 16ms * 12 = 192ms
+                if (channelgoodtimer==0) {
+                    //next channel
+                    rfchannel++;
+                    if (rfchannel>25) rfchannel = 11;
+                    sendRFmessage(SET_RF_CHANNEL_06);
+                    uppstatus = uartprocesspacket(2);
+
+                    transmitpowerlevel = POWMAX; // 0-19
+                    if (rfchannel<14) transmitpowerlevel = POWMAXLOWEND; // 0-19
+                    if (rfchannel>24) transmitpowerlevel = POWMAXHIGHEND; // 0-19
+
+                    //if ((rfchannel<14) ||(rfchannel>24)) transmitpowerlevel = POWMAXENDS; // 0-19
+                    //else transmitpowerlevel = POWMAX; // 0-19
+                    sendRFmessage(SET_TRANSMIT_POWER_LEVEL_08);
+                    uppstatus = uartprocesspacket(2);
+                }
+#if NORMAL_RF_TX
+                sendRFmessage(SEND_SIMPLE_SHORT_ADDRESSING_RF_DATA_PACKET_20);
+#endif
+                xmitcnt = XMITPERIOD;
+                if (comgoodtimer==0) {
+                    comgoodtimer = 2;
+                    PWM2DCH = 20; //
+                    PWM2OE = 1; //
+                }
+            }         
+        }
+    }
+}
+
+
+void interrupt isr(void) {// interrupt service routine
+    
+    if (TMR0IE && TMR0IF) {
+        //PORTAbits.RA1 = 1;
+        TMR0 = 0x04; //16ms irq
+
+        if (rfactive>1) rfactive--;
+        else {
+            if (rfactive==1) {
+                outDESTaddress[0] = 0xDE;
+                outDESTaddress[1] = 0xC0;
+                state = S_WAKE;
+            }
+            rfactive = 0;
+        }
+
+        if (xmitcnt>0) xmitcnt--;
+        if (uartdelaytimer>0) uartdelaytimer--;
+        if (channelgoodtimer>0) channelgoodtimer--;
+        if (comgoodtimer>0) comgoodtimer--;
+        else {
+            PWM2OE = 0; //
+        }
+
+        /*
+        if (flashled>0) {
+            PWM2DCH = 30;
+            if (ledtimer & 0x01) PWM2OE = 1;
+            else PWM2OE = 0;
+            ledtimer++;
+        }
+        */
+
+#if SLEEPFUNCTION
+        sleep16mstimer++;
+        if (sleep16mstimer==62) {
+            sleepsectimer++;
+            sleep16mstimer = 0;
+        }
+#endif
+
+        if (batteryvoltage>=60) PWM1OE = 1;
+        else {
+            PWM1OE = 0;
+        }
+
+        if (batterychecktimer>0) batterychecktimer--;
+        if (batterycounter>0) batterycounter--;
+
+        TMR0IF = 0;
+        //PORTAbits.RA1 = 0;
+    } ////////////////////////////////////////
+
+    // UART RECEIVE IRQ
+    if (RCIF) uartrx();
+
+}
+
+void initUART(void)
+{
+    RCIE = 0;
+
+    SPBRGH = 0;
+
+    switch (BaudRate) {
+        case 4:
+            SPBRGL = 104; //103 8MHz - SYNC=0 BRGH=1 BRGH16=1  = 19.2k
+            break;
+        case 5:
+            SPBRGL = 52; //51 8MHz - SYNC=0 BRGH=1 BRGH16=1  = 38.4k
+            break;
+        case 6:
+            SPBRGL = 35; //34 8MHz - SYNC=0 BRGH=1 BRGH16=1  = 57.6k
+            break;
+        case 7:
+            SPBRGL = 17; //16 8MHz - SYNC=0 BRGH=1 BRGH16=1  = 115.2k
+            break;
+    }
+
+    BAUDCON = 0b00001000; //ABDOVF, RCIDL, -, SCKP=0, BRG16=1, -, WUE=0, ABDEN=0;
+    RCSTA = 0b00000000; //SPEN=0, RX9=0, SREN=0, CREN=0, ADDEN=0, FERR, OERR, RX9D
+    TXSTA = 0b00000110; // CSRC=0, TX9=0, TXEN=0, SYNC=0, SENDB=0, BRGH=1, TRMT=1, TX9D=0
+    BRGH = 1;
+    BRG16 = 1;
+    SPEN = 1;
+    CREN = 1;
+    TXEN = 1;
+    SYNC = 0;
+    RCIF = 0;
+    RCIE = 1;
+}
+void InitRegs(void)
+{
+    //init device
+    GIE = 0;            // disable irq's
+    //OSCCON = 0x7B;      //0b01111011; //16MHZ and internal oscillator block
+    OSCCON = 0x73;      //0b01110011; //8MHZ and internal oscillator block
+    //OSCCON = 0x68;      //0b01101011; //4MHZ and internal oscillator block
+
+    LATA = 0;
+            //xx543210
+    TRISA = 0b11111100; // A2-output others-input
+/*            ||||||||_I:RA0-ICSPDAT (used as debug output)
+ *            |||||||__I:RA1-ICSPCLK (used as debug output)
+ *            ||||||___A:AN2-FWD/REV-TEST-POTENTIOMETER
+ *            |||||____I:RA3-/MCLR
+ *            ||||_____I:RA4-AN3-Battery
+ *            |||______NU: not used
+ *            ||_______NA
+ *            |________NA
+ *
+*/
+    LATA = 0;
+    ANSELA = 0;
+    WPUA = 0x08; // Disable PORTA weak pullups except RA3
+
+    LATB = 0;
+            //7654xxxx
+    TRISB = 0b00111111; // B7,B6-outputs  B5,B4-Inputs
+   /*         ||||||||_NA
+    *         |||||||__NA
+    *         ||||||___NA
+    *         |||||____NA
+    *         ||||_____I:CTS
+    *         |||______I:RX
+    *         ||_______O:RTS
+    *         |________O:TX
+    */
+    LATB = 0;
+    ANSELB = 0;
+    WPUB = 0x80; // Disable PORTB weak pullups except RB7
+
+
+ 
+    LATC = 0x00;
+            //76543210
+    TRISC = 0b10010111; //  C7,C6,C5,C3-outputs  C4,C2,C1,C0-inputs
+/*            ||||||||_I: Selector
+ *            |||||||__I: selector
+ *            ||||||___I: selector
+ *            |||||____O:RC3-PWM2-LED2
+ *            ||||_____I:RC4-NU
+ *            |||______O:RC5-PWM1-LED1
+ *            ||_______O:RC6-\reset
+ *            |________I:RC7-GPIO
+ */
+    
+#if DISABLE_RF
+    LATC = 0x00;
+#else
+    LATC = 0x40; //set proflex reset line
+#endif
+    ANSELC = 0;
+
+    //adc init
+    ANSELA = 0x14;      // RA4 & RA2 is analog input ; RA1,RA0 digital
+   // ADCON0 = 0x0C;      // AN3 on RA4 pin 20 - battery voltage, ADC off
+    //ADCON0 = 0x08;    // AN2 on RA2 pin 14 - motor dir/speed potentiometer, ADC off
+    ADCON1 = 0xA0;      // right justified, Fosc/32 4us at 8Mhz, Vref+ = Vdd(+3.3V)
+    ADCON2 = 0x00;      // manual trigger
+    //ADCON0 |= 0x01;     // ADON
+   //ADCON0 |= 0x02;     // start first conversion
+
+    //enable timer0 irq
+    //OPTION_REG = 0x03; // Weak pullups:enabled, internal FOSC/4, prescaler=Timer0, PS rate = 16
+    OPTION_REG = 0x06; // global Weak pullups:disabled, , internal FOSC/4,
+    //prescaler=Timer0, PS rate = 128
+
+#if SLEEPFUNCTION
+    VREGCON = VREGPM; //sets low power sleep mode
+#endif
+
+    TMR0 = 0x04;
+    TMR0IF = 0;
+    TMR0IE = 1;             // enable timer0 interrupt
+
+    // Enable interrupts
+    //WDTCON = 0x14;      //1s
+    //SWDTEN = 1;           // ENABLE WATCHDOG
+
+
+    //pwm setup
+    TRISC = 0b00111101; // disable RC3-PWM2-blue, and RC5-PWM1-green
+    PWM1CON = 0; //LED1
+    PWM2CON = 0; //LED2
+    PR2 = 101;
+    PWM1DCH = 0; //
+    PWM2DCH = 0; //
+    TMR2IF = 0;
+    TMR2 = 0;
+    T2CON = 0x01; //OFF, prescaler = 4;
+    TMR2ON = 1; //timer 2 is on.
+    //PWM1OE = 1;
+    PWM2OE = 0;
+    while (TMR2IF==0) {};
+    TRISC = 0b00010101; // enable RC3-PWM2, and RC5-PWM1
+    PWM1CON = 0x80;
+    PWM2CON = 0x80;
+
+    //use interrupt on change
+
+    IOCBP = 0x00; // 0x80 RB7 - GDO0 positive edge irq on change register
+    IOCBN = 0x00; // 0x80 RB7 - GDO0 negative edge irq on change register
+    IOCBF = 0;
+    IOCIF = 0;
+
+    //UART
+    ANSELB &= ~0x20; //clear analog select for RB5-RX
+
+    initUART();
+
+    PEIE = 1;             //Peripheral interupt enable
+    ei();                  //enable GIE
+}
