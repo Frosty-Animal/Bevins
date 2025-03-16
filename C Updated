@@ -1,68 +1,126 @@
 #include <xc.h>
+#include <stdio.h>
 
-// Define clock frequency and baud rate
-#define _XTAL_FREQ 16000000   // Assuming a 16MHz clock
+// Configuration: 16MHz clock, 115200 baud UART
+#define _XTAL_FREQ 16000000
 #define BAUD_RATE 115200
 
-// Define pin assignments
-// For example, we assume the following mapping:
-// RC6 = UART TX, RC7 = UART RX, RC2 = WAKE_HW, RB4 = CTS, RB6 = RTS
-
-// WAKE_HW configuration
+// --- Pin Definitions ---
+// WAKE_HW: RN4020 WAKE_HW connected to PIC (example: RC2)
 #define WAKE_HW         LATC2
 #define WAKE_HW_TRIS    TRISC2
 
-// CTS configuration (output from PIC to module)
+// CTS: RN4020 CTS connected to PIC RB4
 #define CTS_PIN         LATB4
 #define CTS_TRIS        TRISB4
 
-// RN4020 RTS is connected to PIC RB6 (input)
+// RTS: RN4020 RTS connected to PIC RB6 (input)
 #define RN4020_RTS      PORTBbits.RB6
-// RB6 must be set as input; no need to define an output register for it.
+
+// --- UART Pins ---
+// Assuming TX on RC6 and RX on RC5 (since RC7 is now used for ADC)
+#define UART_TX         LATC6
+#define UART_TX_TRIS    TRISC6
+#define UART_RX_TRIS    TRISC5
+
+// --- ADC Channel ---
+// RN4020 AIO0 (Pin 4) connected to PIC RC7, assumed as analog channel 7.
+#define ADC_CHANNEL    7
+
+// Function Prototypes
+void UART_Init(void);
+void ADC_Init(void);
+unsigned int ADC_Read(unsigned char channel);
+void UART_Write(char data);
+void UART_SendString(const char* str);
+void WaitFor_RN4020_RTS(void);
+
+void main(void) {
+    UART_Init(); // Initialize UART and flow control pins
+    ADC_Init();  // Initialize ADC for reading RN4020 AIO0
+
+    __delay_ms(100);
+    UART_SendString("$$$"); // Command to enter RN4020 command mode (if needed)
+    __delay_ms(100);
+
+    char buffer[16];
+    unsigned int adc_value;
+    
+    while (1) {
+        // Read the analog value from RN4020 AIO0 (via PIC RC7)
+        adc_value = ADC_Read(ADC_CHANNEL);
+        
+        // For demonstration, convert ADC value to string and send it over UART.
+        sprintf(buffer, "ADC:%u\r\n", adc_value);
+        UART_SendString(buffer);
+        
+        __delay_ms(500);  // Sample every 500ms
+    }
+}
 
 void UART_Init(void) {
-    // Configure UART TX (RC6) and RX (RC7)
-    TRISC6 = 0;  // TX pin output
-    TRISC7 = 1;  // RX pin input
+    // Configure UART TX and RX pins:
+    UART_TX_TRIS = 0;   // TX as output
+    UART_RX_TRIS = 1;   // RX as input
 
     // Configure WAKE_HW pin: set as output and drive high
     WAKE_HW_TRIS = 0;
-    WAKE_HW = 1;  // Keep RN4020 awake
-
-    // Configure CTS pin: set as output and drive high (to signal "clear to send" to RN4020)
+    WAKE_HW = 1;
+    
+    // Configure CTS pin: set as output and drive high (indicating clear-to-send to the RN4020)
     CTS_TRIS = 0;
     CTS_PIN = 1;
-
+    
     // Configure RN4020 RTS pin: set RB6 as input
-    TRISB6 = 1;  // RB6 input for RTS
-
+    TRISB6 = 1;
+    
     // Baud rate configuration for 115200 bps
     SPBRG = ((_XTAL_FREQ / (16 * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // Transmit enabled, high speed (BRGH = 1)
+    TXSTA = 0b00100100;  // TX enabled, high-speed mode (BRGH = 1)
     RCSTA = 0b10010000;  // Serial port enabled, continuous receive enabled
 
-    TXEN = 1;  // Enable transmission
-    SPEN = 1;  // Enable serial port
+    TXEN = 1;
+    SPEN = 1;
 }
 
-// This function polls the RN4020 RTS pin.
-// Assuming that a HIGH on RTS indicates the module is ready for data.
+void ADC_Init(void) {
+    // Enable analog functionality on RC7 by setting the corresponding ANSEL bit.
+    // For PIC16F1509, analog channels on Port C are typically enabled via ANSELC.
+    ANSELCbits.ANSC7 = 1;  // Configure RC7 as analog input.
+
+    // Basic ADC configuration:
+    ADCON0 = 0;  // Clear ADC control register 0
+    ADCON1 = 0;  // Clear ADC control register 1
+    // The ADC will use VDD as reference and provide right-justified results.
+    
+    // Turn on the ADC module
+    ADCON0bits.ADON = 1;
+}
+
+unsigned int ADC_Read(unsigned char channel) {
+    // Select the ADC channel.
+    ADCON0bits.CHS = channel;  // Adjust based on PIC16F1509 datasheet if needed
+    
+    __delay_us(5);             // Acquisition time (may need adjustment)
+    ADCON0bits.GO = 1;         // Start conversion
+    while(ADCON0bits.GO);      // Wait for conversion to finish
+    
+    // Combine the high and low result registers (10-bit ADC).
+    return ((ADRESH << 8) + ADRESL);
+}
+
 void WaitFor_RN4020_RTS(void) {
+    // Wait until the RN4020 indicates it is ready (assuming HIGH = ready).
     while (RN4020_RTS == 0) {
-        // Optionally add a small delay here if necessary.
+        // Optionally include a small delay.
     }
 }
 
 void UART_Write(char data) {
-    // Before transmitting, ensure the RN4020 is ready via the RTS signal.
+    // Check RTS before sending data.
     WaitFor_RN4020_RTS();
-    while (!TXIF);  // Wait until TX buffer is empty
-    TXREG = data;   // Transmit data
-}
-
-char UART_Read(void) {
-    while (!RCIF);  // Wait for data reception
-    return RCREG;   // Return the received data
+    while (!TXIF);  // Wait until the TX buffer is empty.
+    TXREG = data;   // Load data into the transmit register.
 }
 
 void UART_SendString(const char* str) {
@@ -71,16 +129,3 @@ void UART_SendString(const char* str) {
     }
 }
 
-void main(void) {
-    UART_Init();  // Initialize UART and control pins
-
-    __delay_ms(100);  // Small delay before starting communication
-    UART_SendString("$$$");  // Command to enter RN4020 command mode
-    __delay_ms(100);
-
-    while (1) {
-        // Echo received characters (for debugging)
-        char received = UART_Read();
-        UART_Write(received);
-    }
-}
