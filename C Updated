@@ -1,48 +1,68 @@
 #include <xc.h>
 
-// Define baud rate for RN4020 (115200 bps)
+// Define clock frequency and baud rate
 #define _XTAL_FREQ 16000000   // Assuming a 16MHz clock
 #define BAUD_RATE 115200
 
-// Define WAKE_HW pin (connected to PIC Pin 5, assumed to be RC2 for example)
-#define WAKE_HW LATC2  
-#define WAKE_HW_TRIS TRISC2  
+// Define pin assignments
+// For example, we assume the following mapping:
+// RC6 = UART TX, RC7 = UART RX, RC2 = WAKE_HW, RB4 = CTS, RB6 = RTS
 
-// Define CTS pin (connected to PIC RB4, assumed to be RB4)
-#define CTS_PIN LATB4
-#define CTS_TRIS TRISB4
+// WAKE_HW configuration
+#define WAKE_HW         LATC2
+#define WAKE_HW_TRIS    TRISC2
+
+// CTS configuration (output from PIC to module)
+#define CTS_PIN         LATB4
+#define CTS_TRIS        TRISB4
+
+// RN4020 RTS is connected to PIC RB6 (input)
+#define RN4020_RTS      PORTBbits.RB6
+// RB6 must be set as input; no need to define an output register for it.
 
 void UART_Init(void) {
-    // Configure TX (RC6) and RX (RC7) for UART
-    TRISC6 = 0; // TX pin output
-    TRISC7 = 1; // RX pin input
+    // Configure UART TX (RC6) and RX (RC7)
+    TRISC6 = 0;  // TX pin output
+    TRISC7 = 1;  // RX pin input
 
-    // Configure WAKE_HW: Set as output and drive high
-    WAKE_HW_TRIS = 0;  
-    WAKE_HW = 1;       
+    // Configure WAKE_HW pin: set as output and drive high
+    WAKE_HW_TRIS = 0;
+    WAKE_HW = 1;  // Keep RN4020 awake
 
-    // Configure CTS: Set as output and drive high to indicate "clear to send"
-    CTS_TRIS = 0;   
-    CTS_PIN = 1;    
+    // Configure CTS pin: set as output and drive high (to signal "clear to send" to RN4020)
+    CTS_TRIS = 0;
+    CTS_PIN = 1;
+
+    // Configure RN4020 RTS pin: set RB6 as input
+    TRISB6 = 1;  // RB6 input for RTS
 
     // Baud rate configuration for 115200 bps
-    SPBRG = ((_XTAL_FREQ / (16 * BAUD_RATE)) - 1); // Baud rate setting
-    TXSTA = 0b00100100; // Transmit enabled, high speed (BRGH = 1)
-    RCSTA = 0b10010000; // Serial port enabled, continuous receive enabled
+    SPBRG = ((_XTAL_FREQ / (16 * BAUD_RATE)) - 1);
+    TXSTA = 0b00100100;  // Transmit enabled, high speed (BRGH = 1)
+    RCSTA = 0b10010000;  // Serial port enabled, continuous receive enabled
 
-    // Enable the UART module
-    TXEN = 1; // Enable transmission
-    SPEN = 1; // Enable serial port
+    TXEN = 1;  // Enable transmission
+    SPEN = 1;  // Enable serial port
+}
+
+// This function polls the RN4020 RTS pin.
+// Assuming that a HIGH on RTS indicates the module is ready for data.
+void WaitFor_RN4020_RTS(void) {
+    while (RN4020_RTS == 0) {
+        // Optionally add a small delay here if necessary.
+    }
 }
 
 void UART_Write(char data) {
-    while (!TXIF); // Wait until TX buffer is empty
-    TXREG = data;  // Load data into transmit register
+    // Before transmitting, ensure the RN4020 is ready via the RTS signal.
+    WaitFor_RN4020_RTS();
+    while (!TXIF);  // Wait until TX buffer is empty
+    TXREG = data;   // Transmit data
 }
 
 char UART_Read(void) {
-    while (!RCIF); // Wait for data reception
-    return RCREG;  // Return received data
+    while (!RCIF);  // Wait for data reception
+    return RCREG;   // Return the received data
 }
 
 void UART_SendString(const char* str) {
@@ -51,16 +71,16 @@ void UART_SendString(const char* str) {
     }
 }
 
-void main() {
-    UART_Init(); // Initialize UART, WAKE_HW, and CTS
+void main(void) {
+    UART_Init();  // Initialize UART and control pins
 
-    __delay_ms(100); // Delay before sending command mode sequence
-    UART_SendString("$$$"); // Command to enter RN4020 command mode
+    __delay_ms(100);  // Small delay before starting communication
+    UART_SendString("$$$");  // Command to enter RN4020 command mode
     __delay_ms(100);
 
     while (1) {
         // Echo received characters (for debugging)
         char received = UART_Read();
-        UART_Write(received); // Echo back the character
+        UART_Write(received);
     }
 }
