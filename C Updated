@@ -1,0 +1,59 @@
+#include <xc.h>
+
+// Define baud rate for RN4020 (115200 bps)
+#define _XTAL_FREQ 16000000   // Assuming a 16MHz clock
+#define BAUD_RATE 115200
+
+// Define WAKE_HW pin (connected to PIC Pin 5)
+#define WAKE_HW LATC2  // Assuming RC2 (Pin 5 on PIC16F1509)
+#define WAKE_HW_TRIS TRISC2  // Set as output
+
+void UART_Init(void) {
+    // Set TX (RC6) as output, RX (RC7) as input
+    TRISC6 = 0; // TX pin output
+    TRISC7 = 1; // RX pin input
+
+    // Set WAKE_HW as an output and ensure it's HIGH
+    WAKE_HW_TRIS = 0;  // Set RC2 as output
+    WAKE_HW = 1;       // Pull WAKE_HW HIGH to keep RN4020 awake
+
+    // Baud rate configuration for 115200 bps
+    SPBRG = ((_XTAL_FREQ / (16 * BAUD_RATE)) - 1); // Baud rate setting
+    TXSTA = 0b00100100; // Transmit enabled, BRGH = 1 (high speed)
+    RCSTA = 0b10010000; // Serial port enabled, receiver enabled
+
+    // Enable the UART module
+    TXEN = 1; // Enable transmission
+    SPEN = 1; // Enable serial port
+}
+
+void UART_Write(char data) {
+    while (!TXIF); // Wait until TX buffer is empty
+    TXREG = data;  // Load data into transmit register
+}
+
+char UART_Read(void) {
+    while (!RCIF); // Wait for data reception
+    return RCREG;  // Return received data
+}
+
+void UART_SendString(const char* str) {
+    while (*str) {
+        UART_Write(*str++);
+    }
+}
+
+void main() {
+    UART_Init(); // Initialize UART and WAKE_HW
+
+    // Test communication by sending command mode sequence
+    __delay_ms(100); // Small delay before sending
+    UART_SendString("$$$"); // Enter command mode
+    __delay_ms(100);
+
+    while (1) {
+        // Echo received characters (for debugging)
+        char received = UART_Read();
+        UART_Write(received); // Echo back received character
+    }
+}
