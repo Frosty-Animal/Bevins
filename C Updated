@@ -8,9 +8,9 @@
 // -----------------------------------------------------------------
 // UART and Bluetooth Module Pin Definitions
 // -----------------------------------------------------------------
-// For the RN4020 module:
-//   - RN4020 TX -> PIC RX (RB5)
-//   - RN4020 RX -> PIC TX (RB7)
+// RN4020 connections:
+//   - RN4020 TX -> PIC RX on RB5
+//   - RN4020 RX -> PIC TX on RB7
 //   - CTS (from RN4020) is driven by PIC on RB4
 //   - RTS (from RN4020) is read on RB6
 //   - WAKE_HW is driven high on RC2
@@ -25,17 +25,19 @@
 // -----------------------------------------------------------------
 // Motor Control (A3941 Full Bridge) Pin Definitions
 // -----------------------------------------------------------------
-// Motor driver reset is on RC0:
-#define MOTOR_RESET         LATCbits.LATC0
-#define MOTOR_RESET_TRIS    TRISC0
+// Driver reset connection:
+//   - PIC pin 13 (RC0) goes to driver reset (pin 24)
+//   - A 20kΩ pull-down resistor is connected in hardware on the driver side.
+#define DRIVER_RESET         LATC0    // PIC RC0 (pin 13)
+#define DRIVER_RESET_TRIS    TRISC0
 
 // New PWM mapping for the full-bridge driver:
-// - PIC PWM1 (assumed on RA0 for this example) goes to driver PWMH (pin 23)
-// - PIC PWM2 (assumed on RA1 for this example) goes to driver PWML (pin 22)
+//   - PIC PWM1 (assumed here on an output assigned to, e.g., RA0) goes to driver PWMH (pin 23)
+//   - PIC PWM2 (assumed here on an output assigned to, e.g., RA1) goes to driver PWML (pin 22)
 #define PWMH_DUTY    PWM1DCH
 #define PWML_DUTY    PWM2DCH
 
-// Define TRIS bits for these PWM outputs (update these to match your actual PIC pin assignments):
+// Define TRIS bits for these PWM outputs (update as needed to match your actual PIC pin assignments):
 #define PWMH_TRIS    TRISAbits.TRISA0   // PIC PWM1 output (e.g., RA0)
 #define PWML_TRIS    TRISAbits.TRISA1   // PIC PWM2 output (e.g., RA1)
 
@@ -55,18 +57,22 @@ void setMotorSpeedDirection(unsigned char speed, unsigned char direction);
 // Main Function
 // -----------------------------------------------------------------
 void main(void) {
-    UART_Init();   // Initialize UART and Bluetooth control pins
-    Motor_Init();  // Initialize motor control pins and PWM outputs
+    UART_Init();    // Initialize UART and Bluetooth control pins
+    Motor_Init();   // Initialize motor control pins and PWM outputs
 
-    // Bring the motor driver out of reset
-    MOTOR_RESET = 1;
+    // Initially, hold the driver in reset.
+    DRIVER_RESET = 0;  
+    __delay_ms(100); // Allow time for proper reset condition
+
+    // Bring the driver out of reset by driving the PIC reset line high.
+    DRIVER_RESET = 1;
 
     __delay_ms(100);
     UART_SendString("$$$");   // Command to put RN4020 into command mode
     __delay_ms(100);
 
     // Example: Set motor speed and direction.
-    // 'speed' is a value (0-255) representing PWM duty cycle.
+    // 'speed' is a value (0-255) representing the PWM duty cycle.
     // 'direction' is 0 for forward and 1 for reverse.
     setMotorSpeedDirection(128, 0); // 50% duty cycle, forward direction
 
@@ -82,8 +88,8 @@ void main(void) {
 // -----------------------------------------------------------------
 void UART_Init(void) {
     // Configure UART TX and RX pins:
-    UART_TX_TRIS = 0;  // RB7 as output
-    UART_RX_TRIS = 1;  // RB5 as input
+    UART_TX_TRIS = 0;  // Set RB7 as output (TX)
+    UART_RX_TRIS = 1;  // Set RB5 as input (RX)
 
     // Configure WAKE_HW: Set RC2 as output and drive it high.
     WAKE_HW_TRIS = 0;
@@ -98,8 +104,8 @@ void UART_Init(void) {
 
     // Set up UART for 115200 baud.
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // Transmit enabled, BRGH = 1 (high speed)
-    RCSTA = 0b10010000;  // Serial port enabled, continuous receive enabled
+    TXSTA = 0b00100100;  // Enable transmission, high-speed mode (BRGH = 1)
+    RCSTA = 0b10010000;  // Serial port enabled, continuous receive
 
     TXEN = 1;  // Enable transmitter
     SPEN = 1;  // Enable serial port
@@ -113,14 +119,14 @@ void WaitFor_RN4020_RTS(void) {
 }
 
 void UART_Write(char data) {
-    WaitFor_RN4020_RTS();  // Ensure RN4020 is ready
-    while (!TXIF);         // Wait for TX buffer to be free
-    TXREG = data;          // Transmit data
+    WaitFor_RN4020_RTS(); // Ensure RN4020 is ready
+    while (!TXIF);        // Wait for TX buffer to be free
+    TXREG = data;         // Transmit the data
 }
 
 char UART_Read(void) {
-    while (!RCIF);         // Wait for data reception
-    return RCREG;          // Return received data
+    while (!RCIF);        // Wait for data reception
+    return RCREG;         // Return received data
 }
 
 void UART_SendString(const char* str) {
@@ -133,9 +139,10 @@ void UART_SendString(const char* str) {
 // Motor Control Functions
 // -----------------------------------------------------------------
 void Motor_Init(void) {
-    // Configure the motor driver reset pin (RC0) as output and initially hold in reset.
-    MOTOR_RESET_TRIS = 0;
-    MOTOR_RESET = 0;  // Keep in reset until ready
+    // Configure the driver reset pin (RC0, PIC pin 13) as output.
+    DRIVER_RESET_TRIS = 0;
+    // Initially hold the driver in reset.
+    DRIVER_RESET = 0;
 
     // Configure PWM output pins as outputs.
     PWMH_TRIS = 0;
@@ -145,12 +152,12 @@ void Motor_Init(void) {
     PWMH_DUTY = 0;
     PWML_DUTY = 0;
 
-    // (Note: Additional PWM module configuration might be required separately.)
+    // (Note: Ensure that the PWM module is configured separately as required.)
 }
 
 void setMotorSpeedDirection(unsigned char speed, unsigned char direction) {
-    // For forward motion (direction = 0): drive PWMH with the specified speed and set PWML to 0.
-    // For reverse (direction = 1): drive PWML with the specified speed and set PWMH to 0.
+    // For forward motion (direction = 0): drive PWMH with the specified speed and hold PWML at 0.
+    // For reverse (direction = 1): drive PWML with the specified speed and hold PWMH at 0.
     if (direction == 0) {  // Forward
         PWMH_DUTY = speed;
         PWML_DUTY = 0;
