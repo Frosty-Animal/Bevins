@@ -2,8 +2,16 @@
 #include <stdio.h>
 #include <string.h>
 
+// Configuration: assume a 16MHz clock and 115200 baud UART
 #define _XTAL_FREQ 16000000
 #define BAUD_RATE 115200
+
+// -----------------------------------------------------------------
+// Global Timing Variables and Thresholds
+// -----------------------------------------------------------------
+volatile unsigned int linkTimeout = 0;   // Refreshed when RN4020 responds
+volatile unsigned int sleepTimer = 0;      // Incremented in Timer0 ISR
+#define SLEEP_THRESHOLD 5000               // Example threshold (adjust as needed)
 
 // -----------------------------------------------------------------
 // UART and RN4020 Bluetooth Module Pin Definitions
@@ -19,8 +27,8 @@
 #define CTS_PIN         LATB4
 #define CTS_TRIS        TRISB4
 #define RN4020_RTS      PORTBbits.RB6
-#define WAKE_HW         LATC6           // WAKE_HW on RC6 (pin 5)
-#define WAKE_HW_TRIS    TRISC6
+#define WAKE_HW         LATC6           // WAKE_HW now on RC6 (pin 5)
+#define WAKE_HW_TRIS    TRISC6          // TRISC6 for WAKE_HW
 
 // -----------------------------------------------------------------
 // Local Sensor Definitions
@@ -41,15 +49,10 @@
 #define LINK_LED_PIN       LATCbits.LATC5  // Link indicator LED on RC5 (pin 2)
 #define LINK_LED_TRIS      TRISCbits.TRISC5
 
-// LED control functions for power/status LED
+// LED control functions (for power/status LED)
 void LED_On(void) { POWER_LED_PIN = 1; }
 void LED_Off(void) { POWER_LED_PIN = 0; }
 void LED_Toggle(void) { POWER_LED_PIN = !POWER_LED_PIN; }
-
-// -----------------------------------------------------------------
-// Global Variable for Link Indicator Timeout
-// -----------------------------------------------------------------
-volatile unsigned char linkTimeout = 0; // Refreshed when RN4020 responds
 
 // -----------------------------------------------------------------
 // Function Prototypes
@@ -64,7 +67,8 @@ unsigned int readLocalPot(void);
 void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout);
 unsigned int readBattery(void);
 void checkBattery(void);
-void checkLocalPot(void);
+void Timer0_Init(void);
+void __interrupt() isr(void);
 
 // -----------------------------------------------------------------
 // Main Function
@@ -75,7 +79,8 @@ void main(void) {
     // Initialize subsystems
     UART_Init();
     ADC_Init();
-    
+    Timer0_Init();  // Initialize Timer0 for periodic interrupts
+
     // Configure LED outputs:
     POWER_LED_TRIS = 0;   // Power indicator LED (RC3) as output
     LED_Off();            // Start with power LED off
@@ -97,12 +102,13 @@ void main(void) {
 
     // Optionally, read the response (expected "CMD")
     RN4020_SendCommand("", response, 500);
+    // (Response check can be added if desired)
 
     // Send a configuration command (example: set device name)
     RN4020_SendCommand("SN,Transmitter", response, 500);
     __delay_ms(100);
 
-    // Exit command mode (example command; refer to RN4020 datasheet)
+    // Exit command mode (example command, see RN4020 datasheet)
     RN4020_SendCommand("C", response, 500);
     __delay_ms(100);
 
@@ -112,26 +118,38 @@ void main(void) {
 
     // Refresh link indicator on startup
     linkTimeout = 50;
+    sleepTimer = 0; // Reset sleep timer
 
     while (1) {
         // Update link indicator:
         if (linkTimeout > 0) {
-            linkTimeout--;      // Decrement timeout counter
-            LINK_LED_PIN = 1;   // Turn link LED on (link active)
+            LINK_LED_PIN = 1;   // Link active
         } else {
-            LINK_LED_PIN = 0;   // Turn link LED off (link lost)
+            LINK_LED_PIN = 0;   // Link lost
         }
         
-        // Always read the local potentiometer and send its value
+        // Continuously read the local potentiometer and send its value
         unsigned int potValue = readLocalPot();
         char dataBuffer[30];
         sprintf(dataBuffer, "POT:%u\r\n", (unsigned char)(potValue >> 2));
         UART_SendString(dataBuffer);
         linkTimeout = 50;   // Refresh link indicator on valid transmission
-
+        
         // Check battery voltage and update the power indicator LED
         checkBattery();
-
+        
+        // If no activity occurs, sleepTimer will increment in the ISR.
+        // If sleepTimer exceeds the threshold, put the MCU to sleep.
+        if (sleepTimer >= SLEEP_THRESHOLD) {
+            // Before sleeping, disable interrupts
+            di();
+            // Optionally, turn off peripherals here
+            SLEEP();  // Enter low-power sleep mode
+            // MCU wakes up on an interrupt (e.g., Timer0)
+            ei();
+            sleepTimer = 0;  // Reset sleep timer after waking up
+        }
+        
         __delay_ms(500);
     }
 }
@@ -157,7 +175,7 @@ void UART_Init(void) {
     
     // Setup 115200 baud
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // TX enabled, high-speed (BRGH = 1)
+    TXSTA = 0b00100100;  // TX enabled, BRGH = 1 (high speed)
     RCSTA = 0b10010000;  // Serial port enabled, continuous receive
     TXEN = 1;
     SPEN = 1;
@@ -257,10 +275,39 @@ void checkBattery(void) {
     UART_SendString(buffer);
     
     // Use the power indicator LED on RC3 (pin 4) to indicate power status.
-    // For example, if voltage >= 3.0V, turn LED on.
     if (voltage >= 3.0)
-        POWER_LED_PIN = 1;
+        POWER_LED_PIN = 1;   // Good power: LED on
     else
-        POWER_LED_PIN = 0;
+        POWER_LED_PIN = 0;   // Low power: LED off
 }
+
+// -----------------------------------------------------------------
+// Timer0 Initialization and Interrupt Service Routine
+// -----------------------------------------------------------------
+void Timer0_Init(void) {
+    // Configure Timer0 for periodic interrupts
+    // OPTION_REG: Prescaler set to 256 (adjust as needed)
+    OPTION_REG = 0x07;  // PS bits = 111 (1:256), T0CS = 0 (Fosc/4 clock)
+    TMR0 = 0;           // Initial timer value (adjust if a specific interval is needed)
+    TMR0IF = 0;         // Clear Timer0 interrupt flag
+    TMR0IE = 1;         // Enable Timer0 interrupt
+}
+
+void __interrupt() isr(void) {
+    if (TMR0IF) {
+        // Reload Timer0 as needed (here, we simply reset to 0)
+        TMR0 = 0;
+        TMR0IF = 0;
+        
+        // Update link indicator timeout
+        if (linkTimeout > 0) linkTimeout--;
+        
+        // Update sleep timer
+        sleepTimer++;
+    }
+}
+
+// -----------------------------------------------------------------
+// (No checkLocalPot() function needed since pot is read continuously)
+// -----------------------------------------------------------------
 
