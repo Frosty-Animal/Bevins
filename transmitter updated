@@ -1,0 +1,188 @@
+#include <xc.h>
+#include <stdio.h>
+#include <string.h>
+
+#define _XTAL_FREQ 16000000
+#define BAUD_RATE 115200
+
+// -----------------------------------------------------------------
+// UART and RN4020 Bluetooth Module Pin Definitions
+// -----------------------------------------------------------------
+// RN4020 connections:
+//   - TX (from RN4020) → PIC RX on RB5
+//   - RX (to RN4020)   → PIC TX on RB7
+//   - CTS (from RN4020) is driven by PIC on RB4 (set high)
+//   - RTS (from RN4020) is read on PIC RB6
+//   - WAKE_HW (to RN4020) is driven high on RC2
+#define UART_TX_TRIS    TRISB7
+#define UART_RX_TRIS    TRISB5
+#define CTS_PIN         LATB4
+#define CTS_TRIS        TRISB4
+#define RN4020_RTS      PORTBbits.RB6
+#define WAKE_HW         LATC2
+#define WAKE_HW_TRIS    TRISC2
+
+// -----------------------------------------------------------------
+// Local Sensor & Switch Definitions
+// -----------------------------------------------------------------
+// Local potentiometer (for sensor data) on PIC pin 11; assume RA2 (AN2)
+#define LOCAL_POT_CHANNEL  2      // AN2
+#define POT_TRIS           TRISAbits.TRISA2
+
+// Local mode switch on PIC pin 19; assume RA5 (active low)
+#define SWITCH_PIN         PORTAbits.RA5
+#define SWITCH_TRIS        TRISAbits.TRISA5
+
+// -----------------------------------------------------------------
+// Function Prototypes
+// -----------------------------------------------------------------
+void UART_Init(void);
+void UART_Write(char data);
+char UART_Read(void);
+void UART_SendString(const char* str);
+void WaitFor_RN4020_RTS(void);
+void ADC_Init(void);
+unsigned int readLocalPot(void);
+void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout);
+
+// -----------------------------------------------------------------
+// Main Function
+// -----------------------------------------------------------------
+void main(void) {
+    char response[30] = {0};
+
+    // Initialize peripherals
+    UART_Init();
+    ADC_Init();
+    
+    // Configure the switch as digital input (active low)
+    SWITCH_TRIS = 1;
+    
+    // Set WAKE_HW (RC2) as output and drive it high to wake the RN4020
+    WAKE_HW_TRIS = 0;
+    WAKE_HW = 1;
+    
+    // Set CTS pin (RB4) as output and drive it high
+    CTS_TRIS = 0;
+    CTS_PIN = 1;
+    
+    // Optional: small delay to let RN4020 power up
+    __delay_ms(100);
+    
+    // Enter command mode: send "$$$"
+    UART_SendString("$$$");
+    __delay_ms(100);
+    
+    // Optionally, read the response (should be "CMD")
+    RN4020_SendCommand("", response, 500);
+    // You might check that 'response' contains "CMD"
+    
+    // Send configuration command (example: set device name)
+    RN4020_SendCommand("SN,Transmitter", response, 500);
+    __delay_ms(100);
+    
+    // Exit command mode (example command, check your RN4020 datasheet)
+    RN4020_SendCommand("C", response, 500);
+    __delay_ms(100);
+    
+    // Now the RN4020 is in data mode
+    UART_SendString("Transmitter Ready\r\n");
+    
+    while (1) {
+        // If the local mode switch is pressed, use the on-board pot for sensor data
+        if (SWITCH_PIN == 0) {
+            unsigned int potValue = readLocalPot();
+            char dataBuffer[30];
+            sprintf(dataBuffer, "POT:%u\r\n", potValue);
+            UART_SendString(dataBuffer);
+        }
+        __delay_ms(500);
+    }
+}
+
+// -----------------------------------------------------------------
+// UART Functions
+// -----------------------------------------------------------------
+void UART_Init(void) {
+    // Configure UART TX (RB7) as output and RX (RB5) as input
+    UART_TX_TRIS = 0;
+    UART_RX_TRIS = 1;
+    
+    // Set up UART for 115200 baud
+    SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
+    TXSTA = 0b00100100;  // TX enabled, high-speed (BRGH = 1)
+    RCSTA = 0b10010000;  // Serial port enabled, continuous receive
+    TXEN = 1;
+    SPEN = 1;
+}
+
+void UART_Write(char data) {
+    WaitFor_RN4020_RTS();  // Ensure RN4020 is ready (assuming active high ready)
+    while (!TXIF);
+    TXREG = data;
+}
+
+char UART_Read(void) {
+    while (!RCIF);
+    return RCREG;
+}
+
+void UART_SendString(const char* str) {
+    while (*str) {
+        UART_Write(*str++);
+    }
+}
+
+void WaitFor_RN4020_RTS(void) {
+    // Wait until the RN4020's RTS indicates it's ready to receive data.
+    while (RN4020_RTS == 0) {
+        // Optionally, add a short delay here.
+    }
+}
+
+// -----------------------------------------------------------------
+// ADC Functions for Local Potentiometer (AN2 on RA2)
+// -----------------------------------------------------------------
+void ADC_Init(void) {
+    // Enable analog function on RA2 (bit 2 of ANSELA)
+    ANSELA |= 0x04;  // Bit mask: 0x04 sets AN2 as analog
+    // Configure ADC: right justified, Fosc/32, Vref = VDD.
+    ADCON1 = 0xA0;
+    ADCON2 = 0x00; // Manual trigger
+}
+
+unsigned int readLocalPot(void) {
+    // Select channel for local pot (AN2)
+    ADCON0 = (LOCAL_POT_CHANNEL << 2); // Channel bits in ADCON0
+    ADCON0bits.ADON = 1;               // Turn on ADC
+    __delay_us(10);                    // Acquisition time
+    ADCON0bits.GO_nDONE = 1;           // Start conversion
+    while (ADCON0bits.GO_nDONE);       // Wait for conversion
+    unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
+    return result;
+}
+
+// -----------------------------------------------------------------
+// RN4020 Command Function
+// -----------------------------------------------------------------
+void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout) {
+    // If a command string is provided, send it followed by a carriage return.
+    if (strlen(cmd) > 0) {
+        UART_SendString(cmd);
+        UART_Write('\r');
+    }
+    // Wait for response until timeout (in ms)
+    unsigned int timer = 0;
+    unsigned int idx = 0;
+    responseBuffer[0] = '\0';  // Clear buffer
+    while (timer < timeout) {
+        if (RCIF) {
+            char ch = UART_Read();
+            responseBuffer[idx++] = ch;
+            responseBuffer[idx] = '\0';
+            if (ch == '\n') break;  // End of line received
+        }
+        __delay_ms(1);
+        timer++;
+    }
+}
