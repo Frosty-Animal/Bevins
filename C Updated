@@ -42,9 +42,15 @@
 // -----------------------------------------------------------------
 // Fault Flag Definitions
 // -----------------------------------------------------------------
-// Fault Flag 1 is connected to PIC RC4 (original ProFLEX designated FAULT pin)
+// Fault Flag 1 is connected to PIC RC4 (per original schematic)
 #define FAULT_FLAG1         PORTCbits.RC4
 #define FAULT_FLAG1_TRIS    TRISCbits.TRISC4
+
+// -----------------------------------------------------------------
+// Battery Voltage Monitoring Definitions
+// -----------------------------------------------------------------
+// Battery voltage is measured on RA4 (PIC pin 20), configured as AN3.
+#define BATTERY_ADC_CHANNEL 3   // RA4 is AN3
 
 // -----------------------------------------------------------------
 // Function Prototypes
@@ -59,12 +65,14 @@ void Motor_Init(void);
 void setMotorSpeedDirection(unsigned char speed, unsigned char direction);
 void checkFaultFlag(void);
 
-// -----------------------------------------------------------------
-// Main Function
-// -----------------------------------------------------------------
+void ADC_Init(void);
+unsigned int readBattery(void);
+void checkBattery(void);
+
 void main(void) {
     UART_Init();    // Initialize UART and Bluetooth control pins
-    Motor_Init();   // Initialize motor control pins and PWM outputs
+    Motor_Init();   // Initialize motor control pins, PWM outputs, and fault flag input
+    ADC_Init();     // Initialize ADC for battery voltage measurement
 
     // Initially, hold the driver in reset.
     DRIVER_RESET = 0;
@@ -78,17 +86,20 @@ void main(void) {
     __delay_ms(100);
 
     // Example: Set motor speed and direction.
-    // 'speed' is a value (0-255) representing the PWM duty cycle.
-    // 'direction' is 0 for forward and 1 for reverse.
     setMotorSpeedDirection(128, 0); // 50% duty cycle, forward direction
 
     while (1) {
-        // Check the fault flag periodically.
+        // Check for a fault condition.
         checkFaultFlag();
         
-        // For demonstration, echo received UART characters.
+        // Check battery voltage and send reading over UART.
+        checkBattery();
+        
+        // For demonstration, echo any received UART characters.
         char received = UART_Read();
         UART_Write(received);
+        
+        __delay_ms(500); // Delay between iterations
     }
 }
 
@@ -96,46 +107,45 @@ void main(void) {
 // UART Functions
 // -----------------------------------------------------------------
 void UART_Init(void) {
-    // Configure UART TX and RX pins:
-    UART_TX_TRIS = 0;  // Set RB7 as output (TX)
-    UART_RX_TRIS = 1;  // Set RB5 as input (RX)
-
+    // Configure UART TX and RX pins.
+    UART_TX_TRIS = 0;  // RB7 as output (TX)
+    UART_RX_TRIS = 1;  // RB5 as input (RX)
+    
     // Configure WAKE_HW: Set RC2 as output and drive it high.
     WAKE_HW_TRIS = 0;
     WAKE_HW = 1;
-
-    // Configure CTS: Set RB4 as output and drive high.
+    
+    // Configure CTS: Set RB4 as output and drive it high.
     CTS_TRIS = 0;
     CTS_PIN = 1;
-
+    
     // Configure RN4020 RTS: Set RB6 as input.
     TRISB6 = 1;
-
+    
     // Set up UART for 115200 baud.
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // Transmit enabled, BRGH = 1 (high-speed)
+    TXSTA = 0b00100100;  // TX enabled, BRGH = 1 (high speed)
     RCSTA = 0b10010000;  // Serial port enabled, continuous receive enabled
-
-    TXEN = 1;  // Enable transmitter
-    SPEN = 1;  // Enable serial port
+    TXEN = 1;            // Enable transmitter
+    SPEN = 1;            // Enable serial port
 }
 
 void WaitFor_RN4020_RTS(void) {
-    // Wait until the RN4020 indicates it is ready to receive data.
+    // Wait until the RN4020 indicates it is ready.
     while (RN4020_RTS == 0) {
-        // Optionally add a small delay if needed.
+        // Optionally, add a small delay here.
     }
 }
 
 void UART_Write(char data) {
     WaitFor_RN4020_RTS();  // Ensure RN4020 is ready
-    while (!TXIF);         // Wait for TX buffer to be free
-    TXREG = data;          // Transmit the data
+    while (!TXIF);         // Wait until TX buffer is free
+    TXREG = data;          // Transmit data
 }
 
 char UART_Read(void) {
     while (!RCIF);         // Wait for data reception
-    return RCREG;          // Return received data
+    return RCREG;          // Return the received character
 }
 
 void UART_SendString(const char* str) {
@@ -148,7 +158,7 @@ void UART_SendString(const char* str) {
 // Motor Control Functions
 // -----------------------------------------------------------------
 void Motor_Init(void) {
-    // Configure the driver reset pin (RC0, PIC pin 13) as output.
+    // Configure the driver reset pin (RC0, PIC pin 13) as an output.
     DRIVER_RESET_TRIS = 0;
     // Initially hold the driver in reset.
     DRIVER_RESET = 0;
@@ -161,15 +171,13 @@ void Motor_Init(void) {
     PWMH_DUTY = 0;
     PWML_DUTY = 0;
     
-    // Configure the fault flag pin as input.
+    // Configure the fault flag pin as an input.
     FAULT_FLAG1_TRIS = 1;
-    
-    // (Note: Ensure that the PWM module is configured separately as required.)
 }
 
 void setMotorSpeedDirection(unsigned char speed, unsigned char direction) {
-    // For forward motion (direction = 0): drive PWMH with the specified speed and hold PWML at 0.
-    // For reverse (direction = 1): drive PWML with the specified speed and hold PWMH at 0.
+    // For forward motion (direction = 0): drive PWMH and set PWML to 0.
+    // For reverse (direction = 1): drive PWML and set PWMH to 0.
     if (direction == 0) {  // Forward
         PWMH_DUTY = speed;
         PWML_DUTY = 0;
@@ -179,19 +187,16 @@ void setMotorSpeedDirection(unsigned char speed, unsigned char direction) {
     }
 }
 
-// -----------------------------------------------------------------
-// Fault Flag Monitoring Function
-// -----------------------------------------------------------------
 void checkFaultFlag(void) {
-    // Assuming the fault flag is active low:
+    // Assuming Fault Flag is active low:
     if (FAULT_FLAG1 == 0) {
-        // Fault detected. Disable motor outputs and hold the driver in reset.
+        // Fault detected—disable motor outputs and hold the driver in reset.
         PWMH_DUTY = 0;
         PWML_DUTY = 0;
-        DRIVER_RESET = 0;  // Optionally hold the driver in reset.
+        DRIVER_RESET = 0;
         UART_SendString("FAULT DETECTED\r\n");
         
-        // Wait here until the fault is cleared.
+        // Wait until the fault flag is cleared.
         while (FAULT_FLAG1 == 0) {
             __delay_ms(100);
         }
@@ -201,3 +206,35 @@ void checkFaultFlag(void) {
         UART_SendString("FAULT CLEARED\r\n");
     }
 }
+
+// -----------------------------------------------------------------
+// ADC / Battery Voltage Functions
+// -----------------------------------------------------------------
+void ADC_Init(void) {
+    // Enable analog function on RA4 (bit 4 of ANSELA) for battery voltage.
+    ANSELA |= 0x10;
+    // Configure ADC: right justified, Fosc/32, Vref = Vdd.
+    ADCON1 = 0xA0;
+    ADCON2 = 0x00; // Manual trigger.
+}
+
+unsigned int readBattery(void) {
+    // Select channel for RA4 (AN3) by shifting the channel number into ADCON0.
+    ADCON0 = (BATTERY_ADC_CHANNEL << 2);  // Bits 2-5 for channel selection.
+    ADCON0bits.ADON = 1;                   // Turn on the ADC.
+    __delay_us(10);                        // Acquisition time.
+    ADCON0bits.GO_nDONE = 1;               // Start conversion.
+    while(ADCON0bits.GO_nDONE);            // Wait for conversion to finish.
+    unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
+    return result;
+}
+
+void checkBattery(void) {
+    unsigned int adcValue = readBattery();
+    // Assuming a 10-bit ADC (0-1023) with Vref = 3.3V.
+    float voltage = adcValue * (3.3 / 1023.0);
+    char buffer[30];
+    sprintf(buffer, "Battery: %.2fV\r\n", voltage);
+    UART_SendString(buffer);
+}
+
