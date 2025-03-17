@@ -19,33 +19,32 @@
 #define CTS_PIN         LATB4
 #define CTS_TRIS        TRISB4
 #define RN4020_RTS      PORTBbits.RB6
-#define WAKE_HW         LATC6           // WAKE_HW now on RC6 (pin 5)
-#define WAKE_HW_TRIS    TRISC6          // TRISC6 for WAKE_HW
+#define WAKE_HW         LATC6           // WAKE_HW on RC6 (pin 5)
+#define WAKE_HW_TRIS    TRISC6
 
 // -----------------------------------------------------------------
-// Local Sensor & Switch Definitions
+// Local Sensor Definitions
 // -----------------------------------------------------------------
 // Local potentiometer (for sensor data) is connected to PIC pin 14,
 // which corresponds to RA2 (configured as AN2)
 #define LOCAL_POT_CHANNEL  2      // AN2 on RA2 (pin 14)
 #define POT_TRIS           TRISAbits.TRISA2
 
-// Local mode switch on PIC pin 19; assume RA5 (active low)
-#define SWITCH_PIN         PORTAbits.RA5
-#define SWITCH_TRIS        TRISAbits.TRISA5
-
 // -----------------------------------------------------------------
 // LED Definitions
 // -----------------------------------------------------------------
-// In this design, we use two LEDs:
-//   - The power indicator LED is connected to PIC pin 4 (assumed RC3)
-//     and indicates whether the battery voltage is above a threshold.
-//   - The link indicator LED remains on PIC pin 2 (assumed RC5).
+// Power indicator LED is connected to PIC pin 4 (assume RC3)
+// Link indicator LED is on PIC pin 2, which maps to RC5 per the datasheet.
 #define POWER_LED_PIN      LATCbits.LATC3  // Power indicator LED on RC3 (pin 4)
 #define POWER_LED_TRIS     TRISCbits.TRISC3
 
 #define LINK_LED_PIN       LATCbits.LATC5  // Link indicator LED on RC5 (pin 2)
 #define LINK_LED_TRIS      TRISCbits.TRISC5
+
+// LED control functions for power/status LED
+void LED_On(void) { POWER_LED_PIN = 1; }
+void LED_Off(void) { POWER_LED_PIN = 0; }
+void LED_Toggle(void) { POWER_LED_PIN = !POWER_LED_PIN; }
 
 // -----------------------------------------------------------------
 // Global Variable for Link Indicator Timeout
@@ -76,20 +75,16 @@ void main(void) {
     // Initialize subsystems
     UART_Init();
     ADC_Init();
-    // (Motor control functions remain even if no motor is driven; they can be removed if not needed.)
-    
-    // Configure the switch (active low) as digital input
-    SWITCH_TRIS = 1;
     
     // Configure LED outputs:
     POWER_LED_TRIS = 0;   // Power indicator LED (RC3) as output
-    POWER_LED_PIN = 0;    // Start with power LED off
+    LED_Off();            // Start with power LED off
     LINK_LED_TRIS = 0;    // Link indicator LED (RC5) as output
     LINK_LED_PIN = 0;     // Start with link LED off
 
     // Configure RN4020 control pins:
     WAKE_HW_TRIS = 0;
-    WAKE_HW = 1;         // Drive WAKE_HW high (now on RC6) to wake RN4020
+    WAKE_HW = 1;         // Drive WAKE_HW high (RC6) to wake RN4020
     CTS_TRIS = 0;
     CTS_PIN = 1;         // Drive CTS high
 
@@ -97,26 +92,27 @@ void main(void) {
 
     // Enter command mode: send "$$$"
     UART_SendString("$$$");
+    LED_Toggle();        // Toggle power LED to indicate command mode entry
     __delay_ms(100);
-    
+
     // Optionally, read the response (expected "CMD")
     RN4020_SendCommand("", response, 500);
-    
+
     // Send a configuration command (example: set device name)
     RN4020_SendCommand("SN,Transmitter", response, 500);
     __delay_ms(100);
-    
-    // Exit command mode (example command, see RN4020 datasheet)
+
+    // Exit command mode (example command; refer to RN4020 datasheet)
     RN4020_SendCommand("C", response, 500);
     __delay_ms(100);
-    
+
     // Indicate transmitter is ready
     UART_SendString("Transmitter Ready\r\n");
-    // Assume that if the device is powered, the power LED will be controlled by checkBattery()
+    LED_On();  // Turn on power LED to indicate good power
 
     // Refresh link indicator on startup
     linkTimeout = 50;
-    
+
     while (1) {
         // Update link indicator:
         if (linkTimeout > 0) {
@@ -126,17 +122,16 @@ void main(void) {
             LINK_LED_PIN = 0;   // Turn link LED off (link lost)
         }
         
+        // Always read the local potentiometer and send its value
+        unsigned int potValue = readLocalPot();
+        char dataBuffer[30];
+        sprintf(dataBuffer, "POT:%u\r\n", (unsigned char)(potValue >> 2));
+        UART_SendString(dataBuffer);
+        linkTimeout = 50;   // Refresh link indicator on valid transmission
+
         // Check battery voltage and update the power indicator LED
         checkBattery();
-        
-        // If the local mode switch is pressed, read the potentiometer and send its value
-        if (SWITCH_PIN == 0) {  // Active low: switch pressed
-            unsigned int potValue = readLocalPot();
-            char dataBuffer[30];
-            sprintf(dataBuffer, "POT:%u\r\n", potValue);
-            UART_SendString(dataBuffer);
-            linkTimeout = 50;   // Refresh link indicator on valid transmission
-        }
+
         __delay_ms(500);
     }
 }
@@ -162,7 +157,7 @@ void UART_Init(void) {
     
     // Setup 115200 baud
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // TX enabled, BRGH = 1 (high speed)
+    TXSTA = 0b00100100;  // TX enabled, high-speed (BRGH = 1)
     RCSTA = 0b10010000;  // Serial port enabled, continuous receive
     TXEN = 1;
     SPEN = 1;
@@ -209,7 +204,7 @@ unsigned int readLocalPot(void) {
     ADCON0bits.ADON = 1;              // Turn on ADC
     __delay_us(10);                   // Acquisition time
     ADCON0bits.GO_nDONE = 1;          // Start conversion
-    while (ADCON0bits.GO_nDONE);      // Wait for conversion
+    while(ADCON0bits.GO_nDONE);       // Wait for conversion
     unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
     return result;
 }
@@ -249,7 +244,7 @@ unsigned int readBattery(void) {
     ADCON0bits.ADON = 1;
     __delay_us(10);
     ADCON0bits.GO_nDONE = 1;
-    while (ADCON0bits.GO_nDONE);
+    while(ADCON0bits.GO_nDONE);
     unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
     return result;
 }
@@ -261,28 +256,11 @@ void checkBattery(void) {
     sprintf(buffer, "Battery: %.2fV\r\n", voltage);
     UART_SendString(buffer);
     
-    // Use the power indicator LED on RC3 (pin 4) to show if power is good.
-    // For example, if battery voltage is 3.0V or above, turn LED on.
-    if (voltage >= 3.0) {
-        POWER_LED_PIN = 1;   // Power OK, LED on
-    } else {
-        POWER_LED_PIN = 0;   // Low power, LED off
-    }
-}
-
-// -----------------------------------------------------------------
-// Check Local Pot: If switch is pressed, read pot for transmission
-// -----------------------------------------------------------------
-void checkLocalPot(void) {
-    // Switch is active low => 0 means pressed
-    if (SWITCH_PIN == 0) {
-        unsigned int potVal = readLocalPot();
-        // Convert ADC value (0-1023) to a value for transmission (0-255)
-        unsigned char value = (unsigned char)(potVal >> 2);
-        char dataBuffer[30];
-        sprintf(dataBuffer, "POT:%u\r\n", value);
-        UART_SendString(dataBuffer);
-        linkTimeout = 50;   // Refresh link indicator on valid transmission
-    }
+    // Use the power indicator LED on RC3 (pin 4) to indicate power status.
+    // For example, if voltage >= 3.0V, turn LED on.
+    if (voltage >= 3.0)
+        POWER_LED_PIN = 1;
+    else
+        POWER_LED_PIN = 0;
 }
 
