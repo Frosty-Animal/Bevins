@@ -12,7 +12,7 @@
 //   - RN4020 TX -> PIC RX on RB5
 //   - RN4020 RX -> PIC TX on RB7
 //   - CTS (from RN4020) is driven by PIC on RB4
-//   - RTS (from RN4020) is read on RB6
+//   - RTS (from RN4020) is read on PIC RB6
 //   - WAKE_HW is driven high on RC2
 #define UART_TX_TRIS    TRISB7
 #define UART_RX_TRIS    TRISB5
@@ -27,19 +27,24 @@
 // -----------------------------------------------------------------
 // Driver reset connection:
 //   - PIC pin 13 (RC0) goes to driver reset (pin 24)
-//   - A 20kΩ pull-down resistor is connected in hardware on the driver side.
+//   - A 20kΩ pull-down resistor is connected on the driver side.
 #define DRIVER_RESET         LATC0    // PIC RC0 (pin 13)
 #define DRIVER_RESET_TRIS    TRISC0
 
-// New PWM mapping for the full-bridge driver:
-//   - PIC PWM1 (assumed here on an output assigned to, e.g., RA0) goes to driver PWMH (pin 23)
-//   - PIC PWM2 (assumed here on an output assigned to, e.g., RA1) goes to driver PWML (pin 22)
+// PWM mapping for the full-bridge driver:
+//   - PIC PWM1 (assumed on RA0) drives the driver’s PWMH (pin 23)
+//   - PIC PWM2 (assumed on RA1) drives the driver’s PWML (pin 22)
 #define PWMH_DUTY    PWM1DCH
 #define PWML_DUTY    PWM2DCH
-
-// Define TRIS bits for these PWM outputs (update as needed to match your actual PIC pin assignments):
 #define PWMH_TRIS    TRISAbits.TRISA0   // PIC PWM1 output (e.g., RA0)
 #define PWML_TRIS    TRISAbits.TRISA1   // PIC PWM2 output (e.g., RA1)
+
+// -----------------------------------------------------------------
+// Fault Flag Definitions
+// -----------------------------------------------------------------
+// Fault Flag 1 is connected to PIC RC4 (original ProFLEX designated FAULT pin)
+#define FAULT_FLAG1         PORTCbits.RC4
+#define FAULT_FLAG1_TRIS    TRISCbits.TRISC4
 
 // -----------------------------------------------------------------
 // Function Prototypes
@@ -52,6 +57,7 @@ void WaitFor_RN4020_RTS(void);
 
 void Motor_Init(void);
 void setMotorSpeedDirection(unsigned char speed, unsigned char direction);
+void checkFaultFlag(void);
 
 // -----------------------------------------------------------------
 // Main Function
@@ -61,10 +67,10 @@ void main(void) {
     Motor_Init();   // Initialize motor control pins and PWM outputs
 
     // Initially, hold the driver in reset.
-    DRIVER_RESET = 0;  
+    DRIVER_RESET = 0;
     __delay_ms(100); // Allow time for proper reset condition
 
-    // Bring the driver out of reset by driving the PIC reset line high.
+    // Bring the driver out of reset.
     DRIVER_RESET = 1;
 
     __delay_ms(100);
@@ -77,7 +83,10 @@ void main(void) {
     setMotorSpeedDirection(128, 0); // 50% duty cycle, forward direction
 
     while (1) {
-        // Main loop: for demonstration, echo received UART characters.
+        // Check the fault flag periodically.
+        checkFaultFlag();
+        
+        // For demonstration, echo received UART characters.
         char received = UART_Read();
         UART_Write(received);
     }
@@ -104,29 +113,29 @@ void UART_Init(void) {
 
     // Set up UART for 115200 baud.
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // Enable transmission, high-speed mode (BRGH = 1)
-    RCSTA = 0b10010000;  // Serial port enabled, continuous receive
+    TXSTA = 0b00100100;  // Transmit enabled, BRGH = 1 (high-speed)
+    RCSTA = 0b10010000;  // Serial port enabled, continuous receive enabled
 
     TXEN = 1;  // Enable transmitter
     SPEN = 1;  // Enable serial port
 }
 
 void WaitFor_RN4020_RTS(void) {
-    // Wait until the RN4020 indicates it's ready to receive data.
+    // Wait until the RN4020 indicates it is ready to receive data.
     while (RN4020_RTS == 0) {
-        // Optional: add a small delay if needed.
+        // Optionally add a small delay if needed.
     }
 }
 
 void UART_Write(char data) {
-    WaitFor_RN4020_RTS(); // Ensure RN4020 is ready
-    while (!TXIF);        // Wait for TX buffer to be free
-    TXREG = data;         // Transmit the data
+    WaitFor_RN4020_RTS();  // Ensure RN4020 is ready
+    while (!TXIF);         // Wait for TX buffer to be free
+    TXREG = data;          // Transmit the data
 }
 
 char UART_Read(void) {
-    while (!RCIF);        // Wait for data reception
-    return RCREG;         // Return received data
+    while (!RCIF);         // Wait for data reception
+    return RCREG;          // Return received data
 }
 
 void UART_SendString(const char* str) {
@@ -143,15 +152,18 @@ void Motor_Init(void) {
     DRIVER_RESET_TRIS = 0;
     // Initially hold the driver in reset.
     DRIVER_RESET = 0;
-
+    
     // Configure PWM output pins as outputs.
     PWMH_TRIS = 0;
     PWML_TRIS = 0;
-
+    
     // Initialize PWM duty cycles to 0.
     PWMH_DUTY = 0;
     PWML_DUTY = 0;
-
+    
+    // Configure the fault flag pin as input.
+    FAULT_FLAG1_TRIS = 1;
+    
     // (Note: Ensure that the PWM module is configured separately as required.)
 }
 
@@ -164,5 +176,28 @@ void setMotorSpeedDirection(unsigned char speed, unsigned char direction) {
     } else {               // Reverse
         PWMH_DUTY = 0;
         PWML_DUTY = speed;
+    }
+}
+
+// -----------------------------------------------------------------
+// Fault Flag Monitoring Function
+// -----------------------------------------------------------------
+void checkFaultFlag(void) {
+    // Assuming the fault flag is active low:
+    if (FAULT_FLAG1 == 0) {
+        // Fault detected. Disable motor outputs and hold the driver in reset.
+        PWMH_DUTY = 0;
+        PWML_DUTY = 0;
+        DRIVER_RESET = 0;  // Optionally hold the driver in reset.
+        UART_SendString("FAULT DETECTED\r\n");
+        
+        // Wait here until the fault is cleared.
+        while (FAULT_FLAG1 == 0) {
+            __delay_ms(100);
+        }
+        
+        // Fault cleared; bring the driver out of reset.
+        DRIVER_RESET = 1;
+        UART_SendString("FAULT CLEARED\r\n");
     }
 }
