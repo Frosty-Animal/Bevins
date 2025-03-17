@@ -34,6 +34,33 @@
 #define SWITCH_TRIS        TRISAbits.TRISA5
 
 // -----------------------------------------------------------------
+// LED Definitions
+// -----------------------------------------------------------------
+// Status LED (for general status) remains on PIC pin 4 (assume RC3)
+// Link indicator LED is now on PIC pin 2, which maps to RC5 per the datasheet.
+#define STATUS_LED_PIN     LATCbits.LATC3
+#define STATUS_LED_TRIS    TRISCbits.TRISC3
+
+#define LINK_LED_PIN       LATCbits.LATC5  // RC5 used as link indicator (pin 2)
+#define LINK_LED_TRIS      TRISCbits.TRISC5
+
+// LED control functions (for status LED)
+void LED_On(void) {
+    STATUS_LED_PIN = 1;
+}
+void LED_Off(void) {
+    STATUS_LED_PIN = 0;
+}
+void LED_Toggle(void) {
+    STATUS_LED_PIN = !STATUS_LED_PIN;
+}
+
+// -----------------------------------------------------------------
+// Global Variable for Link Indicator Timeout
+// -----------------------------------------------------------------
+volatile unsigned char linkTimeout = 0; // Refreshed when a valid RF packet is received
+
+// -----------------------------------------------------------------
 // Function Prototypes
 // -----------------------------------------------------------------
 void UART_Init(void);
@@ -54,47 +81,67 @@ void main(void) {
     // Initialize peripherals
     UART_Init();
     ADC_Init();
-    
+
     // Configure the switch as digital input (active low)
     SWITCH_TRIS = 1;
     
-    // Set WAKE_HW (RC2) as output and drive it high to wake the RN4020
+    // Configure LED outputs:
+    STATUS_LED_TRIS = 0;  // Status LED (RC3) as output
+    LED_Off();            // Turn status LED off initially
+    
+    LINK_LED_TRIS = 0;    // Link indicator LED (RC5) as output
+    LINK_LED_PIN = 0;     // Start with link LED off
+
+    // Configure RN4020 control pins
     WAKE_HW_TRIS = 0;
-    WAKE_HW = 1;
+    WAKE_HW = 1;         // Drive WAKE_HW high to wake RN4020
     
-    // Set CTS pin (RB4) as output and drive it high
     CTS_TRIS = 0;
-    CTS_PIN = 1;
+    CTS_PIN = 1;         // Drive CTS high
     
-    // Optional: small delay to let RN4020 power up
-    __delay_ms(100);
+    __delay_ms(100);     // Allow RN4020 to power up
     
     // Enter command mode: send "$$$"
     UART_SendString("$$$");
+    LED_Toggle();        // Toggle status LED to indicate command mode entry
     __delay_ms(100);
     
-    // Optionally, read the response (should be "CMD")
+    // Optionally, read the response (expected "CMD")
     RN4020_SendCommand("", response, 500);
-    // You might check that 'response' contains "CMD"
+    // (Response check can be added if desired)
     
-    // Send configuration command (example: set device name)
+    // Send a configuration command (example: set device name)
     RN4020_SendCommand("SN,Transmitter", response, 500);
     __delay_ms(100);
     
-    // Exit command mode (example command, check your RN4020 datasheet)
+    // Exit command mode (example command, see RN4020 datasheet)
     RN4020_SendCommand("C", response, 500);
     __delay_ms(100);
     
-    // Now the RN4020 is in data mode
+    // Indicate transmitter is ready
     UART_SendString("Transmitter Ready\r\n");
+    LED_On();  // Turn on status LED
+    
+    // Refresh link indicator on startup
+    linkTimeout = 50;
     
     while (1) {
-        // If the local mode switch is pressed, use the on-board pot for sensor data
-        if (SWITCH_PIN == 0) {
+        // Update link indicator:
+        if (linkTimeout > 0) {
+            linkTimeout--;      // Decrement timeout counter
+            LINK_LED_PIN = 1;   // Turn link LED on (link active)
+        } else {
+            LINK_LED_PIN = 0;   // Turn link LED off (link lost)
+        }
+        
+        // If the local mode switch is pressed, read the pot and send its value
+        if (SWITCH_PIN == 0) {  // Active low: switch pressed
             unsigned int potValue = readLocalPot();
             char dataBuffer[30];
             sprintf(dataBuffer, "POT:%u\r\n", potValue);
             UART_SendString(dataBuffer);
+            LED_Toggle();       // Optionally toggle status LED
+            linkTimeout = 50;   // Refresh link indicator on valid transmission
         }
         __delay_ms(500);
     }
@@ -110,14 +157,21 @@ void UART_Init(void) {
     
     // Set up UART for 115200 baud
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // TX enabled, high-speed (BRGH = 1)
+    TXSTA = 0b00100100;  // TX enabled, BRGH = 1 (high speed)
     RCSTA = 0b10010000;  // Serial port enabled, continuous receive
     TXEN = 1;
     SPEN = 1;
 }
 
+void WaitFor_RN4020_RTS(void) {
+    // Wait until RN4020's RTS (RB6) indicates readiness (active high)
+    while (RN4020_RTS == 0) {
+        // Optionally add a short delay here
+    }
+}
+
 void UART_Write(char data) {
-    WaitFor_RN4020_RTS();  // Ensure RN4020 is ready (assuming active high ready)
+    WaitFor_RN4020_RTS();
     while (!TXIF);
     TXREG = data;
 }
@@ -133,19 +187,12 @@ void UART_SendString(const char* str) {
     }
 }
 
-void WaitFor_RN4020_RTS(void) {
-    // Wait until the RN4020's RTS indicates it's ready to receive data.
-    while (RN4020_RTS == 0) {
-        // Optionally, add a short delay here.
-    }
-}
-
 // -----------------------------------------------------------------
 // ADC Functions for Local Potentiometer (AN2 on RA2)
 // -----------------------------------------------------------------
 void ADC_Init(void) {
-    // Enable analog function on RA2 (bit 2 of ANSELA)
-    ANSELA |= 0x04;  // Bit mask: 0x04 sets AN2 as analog
+    // Enable analog function on RA2 (bit 2 of ANSELA) for the local potentiometer
+    ANSELA |= 0x04;  // 0x04 sets AN2 as analog
     // Configure ADC: right justified, Fosc/32, Vref = VDD.
     ADCON1 = 0xA0;
     ADCON2 = 0x00; // Manual trigger
@@ -153,11 +200,11 @@ void ADC_Init(void) {
 
 unsigned int readLocalPot(void) {
     // Select channel for local pot (AN2)
-    ADCON0 = (LOCAL_POT_CHANNEL << 2); // Channel bits in ADCON0
-    ADCON0bits.ADON = 1;               // Turn on ADC
-    __delay_us(10);                    // Acquisition time
-    ADCON0bits.GO_nDONE = 1;           // Start conversion
-    while (ADCON0bits.GO_nDONE);       // Wait for conversion
+    ADCON0 = (LOCAL_POT_CHANNEL << 2);
+    ADCON0bits.ADON = 1;              // Turn on ADC
+    __delay_us(10);                   // Acquisition time
+    ADCON0bits.GO_nDONE = 1;          // Start conversion
+    while (ADCON0bits.GO_nDONE);      // Wait for conversion
     unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
     return result;
 }
@@ -166,23 +213,24 @@ unsigned int readLocalPot(void) {
 // RN4020 Command Function
 // -----------------------------------------------------------------
 void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout) {
-    // If a command string is provided, send it followed by a carriage return.
     if (strlen(cmd) > 0) {
         UART_SendString(cmd);
         UART_Write('\r');
     }
-    // Wait for response until timeout (in ms)
     unsigned int timer = 0;
     unsigned int idx = 0;
-    responseBuffer[0] = '\0';  // Clear buffer
+    responseBuffer[0] = '\0';  // Clear response buffer
     while (timer < timeout) {
         if (RCIF) {
             char ch = UART_Read();
             responseBuffer[idx++] = ch;
             responseBuffer[idx] = '\0';
-            if (ch == '\n') break;  // End of line received
+            if (ch == '\n') break;  // End of response
         }
         __delay_ms(1);
         timer++;
+    }
+    if (strlen(responseBuffer) > 0) {
+        linkTimeout = 50;  // Refresh link indicator timeout if response received
     }
 }
