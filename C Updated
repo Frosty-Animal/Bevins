@@ -1,7 +1,7 @@
 #include <xc.h>
 #include <stdio.h>
+#include <string.h>
 
-// Configuration: assume a 16MHz clock and 115200 baud UART
 #define _XTAL_FREQ 16000000
 #define BAUD_RATE 115200
 
@@ -13,14 +13,14 @@
 //   - RN4020 RX -> PIC TX on RB7
 //   - CTS (from RN4020) is driven by PIC on RB4
 //   - RTS (from RN4020) is read on PIC RB6
-//   - WAKE_HW is now driven high on RC6 (PIC pin 5)
+//   - WAKE_HW (to RN4020) is now driven high on RC6 (PIC pin 5)
 #define UART_TX_TRIS    TRISB7
 #define UART_RX_TRIS    TRISB5
 #define CTS_PIN         LATB4
 #define CTS_TRIS        TRISB4
 #define RN4020_RTS      PORTBbits.RB6
-#define WAKE_HW         LATC6           // Updated: WAKE_HW now on RC6
-#define WAKE_HW_TRIS    TRISC6          // Updated: TRISC6 for WAKE_HW
+#define WAKE_HW         LATC6           // WAKE_HW now on RC6 (pin 5)
+#define WAKE_HW_TRIS    TRISC6          // TRISC6 for WAKE_HW
 
 // -----------------------------------------------------------------
 // Motor Control (A3941 Full Bridge) Pin Definitions
@@ -39,6 +39,13 @@
 #define PWML_TRIS    TRISAbits.TRISA1   // PIC PWM2 output (RA1)
 
 // -----------------------------------------------------------------
+// Phase Pin Definition for Driver
+// -----------------------------------------------------------------
+// The driver's Phase input is connected to PIC pin 12 (RC1). We need it always on.
+#define PHASE_PIN      LATC1
+#define PHASE_TRIS     TRISC1
+
+// -----------------------------------------------------------------
 // Fault Flag Definitions
 // -----------------------------------------------------------------
 // Fault Flag 1 is connected to PIC RC4
@@ -53,7 +60,7 @@
 
 // -----------------------------------------------------------------
 // Local Switch & Potentiometer
-// ----------------------------------------------------------------
+// -----------------------------------------------------------------
 // Switch on PIC pin 19 (assume RA5). Active low: 0 = pressed
 #define SWITCH_PIN          PORTAbits.RA5
 #define SWITCH_TRIS         TRISAbits.TRISA5
@@ -97,11 +104,15 @@ void main(void) {
     // Bring the driver out of reset
     DRIVER_RESET = 1;
 
+    // Configure the Phase pin (connected to driver's Phase input) on RC1:
+    PHASE_TRIS = 0;  // Set RC1 as output
+    PHASE_PIN = 1;   // Drive RC1 high (Phase always on)
+
     __delay_ms(100);
     UART_SendString("$$$");  // Put RN4020 in command mode (example)
     __delay_ms(100);
 
-    // Example: initial motor setting
+    // Example: initial motor setting (here used to transmit pot signal)
     setMotorSpeedDirection(128, 0); // 50% duty cycle, forward
 
     while (1) {
@@ -143,8 +154,8 @@ void UART_Init(void) {
 
     // Setup 115200 baud
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // TX enable, BRGH=1 (high speed)
-    RCSTA = 0b10010000;  // Serial port enable, continuous receive
+    TXSTA = 0b00100100;  // TX enable, BRGH = 1 (high speed)
+    RCSTA = 0b10010000;  // Serial port enabled, continuous receive
     TXEN = 1;            
     SPEN = 1;            
 }
