@@ -6,21 +6,21 @@
 #define BAUD_RATE 115200
 
 // -----------------------------------------------------------------
-// UART and Bluetooth Module Pin Definitions
+// UART and RN4020 Bluetooth Module Pin Definitions
 // -----------------------------------------------------------------
 // RN4020 connections:
 //   - RN4020 TX -> PIC RX on RB5
 //   - RN4020 RX -> PIC TX on RB7
 //   - CTS (from RN4020) is driven by PIC on RB4
 //   - RTS (from RN4020) is read on PIC RB6
-//   - WAKE_HW is driven high on RC2
+//   - WAKE_HW is now driven high on RC6 (PIC pin 5)
 #define UART_TX_TRIS    TRISB7
 #define UART_RX_TRIS    TRISB5
 #define CTS_PIN         LATB4
 #define CTS_TRIS        TRISB4
 #define RN4020_RTS      PORTBbits.RB6
-#define WAKE_HW         LATC2
-#define WAKE_HW_TRIS    TRISC2
+#define WAKE_HW         LATC6           // Updated: WAKE_HW now on RC6
+#define WAKE_HW_TRIS    TRISC6          // Updated: TRISC6 for WAKE_HW
 
 // -----------------------------------------------------------------
 // Motor Control (A3941 Full Bridge) Pin Definitions
@@ -130,7 +130,7 @@ void UART_Init(void) {
     UART_TX_TRIS = 0;  // RB7 as output (TX)
     UART_RX_TRIS = 1;  // RB5 as input (RX)
 
-    // WAKE_HW: RC2 as output, drive high
+    // WAKE_HW: now on RC6 as output, drive high
     WAKE_HW_TRIS = 0;
     WAKE_HW = 1;
 
@@ -266,7 +266,7 @@ unsigned int readLocalPot(void) {
     ADCON0bits.ADON = 1;
     __delay_us(10);
     ADCON0bits.GO_nDONE = 1;
-    while (ADCON0bits.GO_nDONE);
+    while(ADCON0bits.GO_nDONE);
     return ((unsigned int)ADRESH << 8) | ADRESL;
 }
 
