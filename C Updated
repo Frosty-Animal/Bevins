@@ -1,94 +1,161 @@
 #include <xc.h>
 #include <stdio.h>
 
-#define _XTAL_FREQ 16000000      // Assume a 16MHz clock
+// Configuration: assume a 16MHz clock and 115200 baud UART
+#define _XTAL_FREQ 16000000
 #define BAUD_RATE 115200
 
-// --- Pin Definitions ---
-// WAKE_HW pin: Connected to RN4020 WAKE_HW, e.g., on RC2
+// -----------------------------------------------------------------
+// UART and Bluetooth Module Pin Definitions
+// -----------------------------------------------------------------
+// For the RN4020 module:
+//   - RN4020 TX -> PIC RX (RB5)
+//   - RN4020 RX -> PIC TX (RB7)
+//   - CTS (from RN4020) is driven by PIC on RB4
+//   - RTS (from RN4020) is read on RB6
+//   - WAKE_HW is driven high on RC2
+#define UART_TX_TRIS    TRISB7
+#define UART_RX_TRIS    TRISB5
+#define CTS_PIN         LATB4
+#define CTS_TRIS        TRISB4
+#define RN4020_RTS      PORTBbits.RB6
 #define WAKE_HW         LATC2
 #define WAKE_HW_TRIS    TRISC2
 
-// CTS pin: Connected to RN4020 CTS, e.g., on RB4
-#define CTS_PIN         LATB4
-#define CTS_TRIS        TRISB4
+// -----------------------------------------------------------------
+// Motor Control (A3941 Full Bridge) Pin Definitions
+// -----------------------------------------------------------------
+// Motor driver reset is on RC0:
+#define MOTOR_RESET         LATCbits.LATC0
+#define MOTOR_RESET_TRIS    TRISC0
 
-// RTS pin: Connected to RN4020 RTS, e.g., on RB6 (input)
-#define RN4020_RTS      PORTBbits.RB6
+// New PWM mapping for the full-bridge driver:
+// - PIC PWM1 (assumed on RA0 for this example) goes to driver PWMH (pin 23)
+// - PIC PWM2 (assumed on RA1 for this example) goes to driver PWML (pin 22)
+#define PWMH_DUTY    PWM1DCH
+#define PWML_DUTY    PWM2DCH
 
-// UART TX and RX pins (example assignment)
-// TX: RC6, RX: RC5
-#define UART_TX_TRIS    TRISC6
-#define UART_RX_TRIS    TRISC5
+// Define TRIS bits for these PWM outputs (update these to match your actual PIC pin assignments):
+#define PWMH_TRIS    TRISAbits.TRISA0   // PIC PWM1 output (e.g., RA0)
+#define PWML_TRIS    TRISAbits.TRISA1   // PIC PWM2 output (e.g., RA1)
 
+// -----------------------------------------------------------------
 // Function Prototypes
+// -----------------------------------------------------------------
 void UART_Init(void);
 void UART_Write(char data);
 char UART_Read(void);
 void UART_SendString(const char* str);
 void WaitFor_RN4020_RTS(void);
 
-void main(void) {
-    UART_Init(); // Initialize UART and control pins
+void Motor_Init(void);
+void setMotorSpeedDirection(unsigned char speed, unsigned char direction);
 
-    __delay_ms(100);        // Delay for stabilization
-    UART_SendString("$$$");  // Send command to put RN4020 into command mode
+// -----------------------------------------------------------------
+// Main Function
+// -----------------------------------------------------------------
+void main(void) {
+    UART_Init();   // Initialize UART and Bluetooth control pins
+    Motor_Init();  // Initialize motor control pins and PWM outputs
+
+    // Bring the motor driver out of reset
+    MOTOR_RESET = 1;
+
+    __delay_ms(100);
+    UART_SendString("$$$");   // Command to put RN4020 into command mode
     __delay_ms(100);
 
+    // Example: Set motor speed and direction.
+    // 'speed' is a value (0-255) representing PWM duty cycle.
+    // 'direction' is 0 for forward and 1 for reverse.
+    setMotorSpeedDirection(128, 0); // 50% duty cycle, forward direction
+
     while (1) {
-        // Simple echo test: read from UART and then transmit back
+        // Main loop: for demonstration, echo received UART characters.
         char received = UART_Read();
         UART_Write(received);
     }
 }
 
+// -----------------------------------------------------------------
+// UART Functions
+// -----------------------------------------------------------------
 void UART_Init(void) {
-    // Configure UART TX and RX pins
-    UART_TX_TRIS = 0; // Set TX (RC6) as output
-    UART_RX_TRIS = 1; // Set RX (RC5) as input
+    // Configure UART TX and RX pins:
+    UART_TX_TRIS = 0;  // RB7 as output
+    UART_RX_TRIS = 1;  // RB5 as input
 
-    // Configure WAKE_HW: set as output and drive high to keep RN4020 awake
+    // Configure WAKE_HW: Set RC2 as output and drive it high.
     WAKE_HW_TRIS = 0;
     WAKE_HW = 1;
 
-    // Configure CTS: set as output and drive high (signal clear-to-send)
+    // Configure CTS: Set RB4 as output and drive high.
     CTS_TRIS = 0;
     CTS_PIN = 1;
 
-    // Configure RN4020 RTS pin: set as input on RB6
+    // Configure RN4020 RTS: Set RB6 as input.
     TRISB6 = 1;
 
-    // Baud rate configuration for 115200 bps
-    SPBRG = ((_XTAL_FREQ / (16 * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // Enable transmission, high-speed mode (BRGH = 1)
-    RCSTA = 0b10010000;  // Enable serial port, enable continuous receive
+    // Set up UART for 115200 baud.
+    SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
+    TXSTA = 0b00100100;  // Transmit enabled, BRGH = 1 (high speed)
+    RCSTA = 0b10010000;  // Serial port enabled, continuous receive enabled
 
-    TXEN = 1;            // Enable transmitter
-    SPEN = 1;            // Enable serial port
+    TXEN = 1;  // Enable transmitter
+    SPEN = 1;  // Enable serial port
 }
 
 void WaitFor_RN4020_RTS(void) {
-    // Wait until the RN4020 indicates it is ready to receive data.
-    // (Assuming a HIGH level on RTS means "ready".)
+    // Wait until the RN4020 indicates it's ready to receive data.
     while (RN4020_RTS == 0) {
-        // Optionally add a small delay here.
+        // Optional: add a small delay if needed.
     }
 }
 
 void UART_Write(char data) {
-    // Ensure the RN4020 is ready before transmitting
-    WaitFor_RN4020_RTS();
-    while (!TXIF);  // Wait for TX buffer to be empty
-    TXREG = data;   // Transmit data
+    WaitFor_RN4020_RTS();  // Ensure RN4020 is ready
+    while (!TXIF);         // Wait for TX buffer to be free
+    TXREG = data;          // Transmit data
 }
 
 char UART_Read(void) {
-    while (!RCIF);  // Wait for data reception
-    return RCREG;   // Return the received data
+    while (!RCIF);         // Wait for data reception
+    return RCREG;          // Return received data
 }
 
 void UART_SendString(const char* str) {
     while (*str) {
         UART_Write(*str++);
+    }
+}
+
+// -----------------------------------------------------------------
+// Motor Control Functions
+// -----------------------------------------------------------------
+void Motor_Init(void) {
+    // Configure the motor driver reset pin (RC0) as output and initially hold in reset.
+    MOTOR_RESET_TRIS = 0;
+    MOTOR_RESET = 0;  // Keep in reset until ready
+
+    // Configure PWM output pins as outputs.
+    PWMH_TRIS = 0;
+    PWML_TRIS = 0;
+
+    // Initialize PWM duty cycles to 0.
+    PWMH_DUTY = 0;
+    PWML_DUTY = 0;
+
+    // (Note: Additional PWM module configuration might be required separately.)
+}
+
+void setMotorSpeedDirection(unsigned char speed, unsigned char direction) {
+    // For forward motion (direction = 0): drive PWMH with the specified speed and set PWML to 0.
+    // For reverse (direction = 1): drive PWML with the specified speed and set PWMH to 0.
+    if (direction == 0) {  // Forward
+        PWMH_DUTY = speed;
+        PWML_DUTY = 0;
+    } else {               // Reverse
+        PWMH_DUTY = 0;
+        PWML_DUTY = speed;
     }
 }
