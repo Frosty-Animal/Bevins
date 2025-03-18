@@ -54,12 +54,12 @@
 
 // -----------------------------------------------------------------
 // Battery Voltage Monitoring
-// ----------------------------------------------------------------
+// -----------------------------------------------------------------
 // Battery is measured on RA4 (pin 20), configured as AN3
 #define BATTERY_ADC_CHANNEL 3
 
 // -----------------------------------------------------------------
-// Local Switch & Potentiometer
+// Local Switch & Potentiometer for Testing
 // -----------------------------------------------------------------
 // Switch on PIC pin 19 (assume RA5). Active low: 0 = pressed
 #define SWITCH_PIN          PORTAbits.RA5
@@ -88,6 +88,8 @@ void checkBattery(void);
 unsigned int readLocalPot(void);
 void checkLocalPot(void);
 
+void processReceivedData(const char *data);
+
 void main(void) {
     // Initialize all subsystems
     UART_Init();    
@@ -112,24 +114,34 @@ void main(void) {
     UART_SendString("$$$");  // Put RN4020 in command mode (example)
     __delay_ms(100);
 
-    // Example: initial motor setting (here used to transmit pot signal)
+    // Example: initial motor setting (for testing, here using local pot signal)
     setMotorSpeedDirection(128, 0); // 50% duty cycle, forward
 
     while (1) {
-        // Check for a fault condition
         checkFaultFlag();
-
-        // Check battery voltage and send reading
         checkBattery();
 
-        // Check if switch is pressed and read pot if so
-        checkLocalPot();
+        // If the test switch is pressed, use the on-board potentiometer
+        if (SWITCH_PIN == 0) {
+            checkLocalPot();
+        } else {
+            // Otherwise, check for received data from the transmitter
+            // Use a non-blocking approach: if data is available, process it.
+            if (RCIF) {
+                char receivedBuffer[50] = {0};
+                unsigned char idx = 0;
+                // Read available characters until newline or buffer full
+                while (RCIF && (idx < sizeof(receivedBuffer) - 1)) {
+                    char ch = UART_Read();
+                    receivedBuffer[idx++] = ch;
+                    if (ch == '\n') break;
+                }
+                receivedBuffer[idx] = '\0';
+                processReceivedData(receivedBuffer);
+            }
+        }
 
-        // Echo any received UART characters (for demo)
-        char received = UART_Read();
-        UART_Write(received);
-
-        __delay_ms(500); // main loop delay
+        __delay_ms(500);
     }
 }
 
@@ -154,7 +166,7 @@ void UART_Init(void) {
 
     // Setup 115200 baud
     SPBRG = ((_XTAL_FREQ / (16UL * BAUD_RATE)) - 1);
-    TXSTA = 0b00100100;  // TX enable, BRGH = 1 (high speed)
+    TXSTA = 0b00100100;  // TX enabled, BRGH = 1 (high speed)
     RCSTA = 0b10010000;  // Serial port enabled, continuous receive
     TXEN = 1;            
     SPEN = 1;            
@@ -239,9 +251,8 @@ void checkFaultFlag(void) {
 // ADC / Battery Voltage Functions
 // -----------------------------------------------------------------
 void ADC_Init(void) {
-    // Example: RA4 -> AN3 for battery, RA2 -> AN2 for local pot
-    // Enable analog on RA4 (bit 4) and RA2 (bit 2) in ANSELA
-    // For instance: RA2 is bit 2, RA4 is bit 4 => 0x14 = b00010100
+    // Enable analog on RA4 (for battery, AN3) and RA2 (for local pot, AN2)
+    // RA2 is bit 2 and RA4 is bit 4 => 0x14 = b00010100
     ANSELA |= 0x14;
 
     // Right justified, Fosc/32, Vref=VDD
@@ -255,7 +266,7 @@ unsigned int readBattery(void) {
     ADCON0bits.ADON = 1;
     __delay_us(10);
     ADCON0bits.GO_nDONE = 1;
-    while(ADCON0bits.GO_nDONE);
+    while (ADCON0bits.GO_nDONE);
     unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
     return result;
 }
@@ -269,33 +280,52 @@ void checkBattery(void) {
 }
 
 // -----------------------------------------------------------------
-// Local Pot Reading (Pin 11 -> RA2 -> AN2)
+// Local Pot Reading (On-board pot on RA2 -> AN2)
 // -----------------------------------------------------------------
 unsigned int readLocalPot(void) {
-    // Local pot on AN2 => RA2
     ADCON0 = (LOCAL_POT_CHANNEL << 2);
     ADCON0bits.ADON = 1;
     __delay_us(10);
     ADCON0bits.GO_nDONE = 1;
-    while(ADCON0bits.GO_nDONE);
+    while (ADCON0bits.GO_nDONE);
     return ((unsigned int)ADRESH << 8) | ADRESL;
 }
 
 // -----------------------------------------------------------------
-// Check Local Pot: If switch is pressed, read pot for motor speed
+// Check Local Pot: Used when switch is pressed for testing
 // -----------------------------------------------------------------
 void checkLocalPot(void) {
     // Switch is active low => 0 means pressed
     if (SWITCH_PIN == 0) {
         unsigned int potVal = readLocalPot();
-        // potVal is 0..1023 from ADC
-        // Convert to 0..255 for duty cycle
+        // Convert the 10-bit pot value (0..1023) to 0..255 for PWM duty cycle
         unsigned char speed = (unsigned char)(potVal >> 2);
-
-        // For demo, always forward direction when using local pot
+        // For local testing, we assume forward direction (direction = 0)
         setMotorSpeedDirection(speed, 0);
+        char buf[30];
+        sprintf(buf, "Local Pot: %u\r\n", speed);
+        UART_SendString(buf);
+    }
+}
+
+// -----------------------------------------------------------------
+// Process Received Data from the Transmitter
+// -----------------------------------------------------------------
+void processReceivedData(const char *data) {
+    int duty;
+    char dirStr[4]; // to hold "FWD" or "REV"
+    
+    // Expecting data in the format: "DC:<duty>, DIR:<dir>\r\n"
+    if (sscanf(data, "DC:%d, DIR:%3s", &duty, dirStr) == 2) {
+        unsigned char directionVal = (strcmp(dirStr, "REV") == 0) ? 1 : 0;
+        // Optionally, map or clamp duty if needed before using it
+        setMotorSpeedDirection((unsigned char)duty, directionVal);
+        
+        // For debugging, print the parsed values
+        char buf[50];
+        sprintf(buf, "Parsed: DC=%d, DIR=%s\r\n", duty, (directionVal==1 ? "REV" : "FWD"));
+        UART_SendString(buf);
     } else {
-        // Switch not pressed => optionally do nothing or stop motor
-        // setMotorSpeedDirection(0, 0);
+        UART_SendString("Invalid data received\r\n");
     }
 }
