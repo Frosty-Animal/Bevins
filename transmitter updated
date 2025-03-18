@@ -16,36 +16,25 @@ volatile unsigned int sleepTimer = 0;      // Incremented in Timer0 ISR
 // -----------------------------------------------------------------
 // UART and RN4020 Bluetooth Module Pin Definitions
 // -----------------------------------------------------------------
-// RN4020 connections:
-//   - RN4020 TX -> PIC RX on RB5
-//   - RN4020 RX -> PIC TX on RB7
-//   - CTS (from RN4020) is driven by PIC on RB4 (set high)
-//   - RTS (from RN4020) is read on PIC RB6
-//   - WAKE_HW (to RN4020) is now driven high on RC6 (PIC pin 5)
 #define UART_TX_TRIS    TRISB7
 #define UART_RX_TRIS    TRISB5
 #define CTS_PIN         LATB4
 #define CTS_TRIS        TRISB4
 #define RN4020_RTS      PORTBbits.RB6
-#define WAKE_HW         LATC6           // WAKE_HW now on RC6 (pin 5)
+#define WAKE_HW         LATC6           // WAKE_HW now on RC6 (PIC pin 5)
 #define WAKE_HW_TRIS    TRISC6          // TRISC6 for WAKE_HW
 
 // -----------------------------------------------------------------
 // Local Sensor Definitions
 // -----------------------------------------------------------------
-// Local potentiometer (for sensor data) is connected to PIC pin 14,
-// which corresponds to RA2 (configured as AN2)
 #define LOCAL_POT_CHANNEL  2      // AN2 on RA2 (pin 14)
 #define POT_TRIS           TRISAbits.TRISA2
 
 // -----------------------------------------------------------------
 // LED Definitions
 // -----------------------------------------------------------------
-// Power indicator LED is connected to PIC pin 4 (assume RC3)
-// Link indicator LED is on PIC pin 2, which maps to RC5 per the datasheet.
 #define POWER_LED_PIN      LATCbits.LATC3  // Power indicator LED on RC3 (pin 4)
 #define POWER_LED_TRIS     TRISCbits.TRISC3
-
 #define LINK_LED_PIN       LATCbits.LATC5  // Link indicator LED on RC5 (pin 2)
 #define LINK_LED_TRIS      TRISCbits.TRISC5
 
@@ -53,6 +42,22 @@ volatile unsigned int sleepTimer = 0;      // Incremented in Timer0 ISR
 void LED_On(void) { POWER_LED_PIN = 1; }
 void LED_Off(void) { POWER_LED_PIN = 0; }
 void LED_Toggle(void) { POWER_LED_PIN = !POWER_LED_PIN; }
+
+// -----------------------------------------------------------------
+// Potentiometer Processing Definitions (for deadband and scaling)
+// -----------------------------------------------------------------
+#define HLO 411               // Lower threshold (deadband start)
+#define HHI 511               // Upper threshold (deadband end)
+float hsf = 0.62;             // Scaling factor for reverse (pot value < HLO)
+float hhsf = 0.74;            // Scaling factor for forward (pot value > HHI)
+
+volatile short dutyCycle = 0;           // Computed duty cycle based on pot reading
+volatile unsigned char direction = 0;     // 0 for forward, 1 for reverse
+
+// -----------------------------------------------------------------
+// Battery ADC Channel (for battery voltage on RA4 = AN3)
+// -----------------------------------------------------------------
+#define BATTERY_ADC_CHANNEL 3
 
 // -----------------------------------------------------------------
 // Function Prototypes
@@ -64,9 +69,10 @@ void UART_SendString(const char* str);
 void WaitFor_RN4020_RTS(void);
 void ADC_Init(void);
 unsigned int readLocalPot(void);
-void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout);
 unsigned int readBattery(void);
 void checkBattery(void);
+void CheckPot(void);  // New function for processing potentiometer reading
+void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout);
 void Timer0_Init(void);
 void __interrupt() isr(void);
 
@@ -128,12 +134,8 @@ void main(void) {
             LINK_LED_PIN = 0;   // Link lost
         }
         
-        // Continuously read the local potentiometer and send its value
-        unsigned int potValue = readLocalPot();
-        char dataBuffer[30];
-        sprintf(dataBuffer, "POT:%u\r\n", (unsigned char)(potValue >> 2));
-        UART_SendString(dataBuffer);
-        linkTimeout = 50;   // Refresh link indicator on valid transmission
+        // Instead of sending raw pot value, process it with CheckPot()
+        CheckPot();
         
         // Check battery voltage and update the power indicator LED
         checkBattery();
@@ -142,11 +144,11 @@ void main(void) {
         // If sleepTimer exceeds the threshold, put the MCU to sleep.
         if (sleepTimer >= SLEEP_THRESHOLD) {
             // Before sleeping, disable interrupts
-            di();
+            di();  // Disable global interrupts (or use INTCONbits.GIE = 0;)
             // Optionally, turn off peripherals here
             SLEEP();  // Enter low-power sleep mode
             // MCU wakes up on an interrupt (e.g., Timer0)
-            ei();
+            ei();  // Enable global interrupts (or use INTCONbits.GIE = 1;)
             sleepTimer = 0;  // Reset sleep timer after waking up
         }
         
@@ -211,6 +213,8 @@ void UART_SendString(const char* str) {
 void ADC_Init(void) {
     // Enable analog function on RA2 (bit 2 of ANSELA) for the local potentiometer
     ANSELA |= 0x04;  // 0x04 sets AN2 as analog
+    // Enable analog function on RA4 (bit 4 of ANSELA) for battery (AN3)
+    ANSELA |= 0x10;  // 0x10 sets AN4 as analog (adjust if needed for AN3)
     // Configure ADC: right justified, Fosc/32, Vref = VDD.
     ADCON1 = 0xA0;
     ADCON2 = 0x00; // Manual trigger
@@ -225,6 +229,67 @@ unsigned int readLocalPot(void) {
     while(ADCON0bits.GO_nDONE);       // Wait for conversion
     unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
     return result;
+}
+
+// -----------------------------------------------------------------
+// CheckPot: Process the potentiometer reading with deadband and scaling
+// -----------------------------------------------------------------
+void CheckPot(void) {
+    unsigned int rawValue = readLocalPot();  // Read raw ADC value (0-1023)
+    
+    if ((rawValue >= HLO) && (rawValue <= HHI)) {
+         dutyCycle = 0;  // Within deadband: no movement
+    }
+    else if (rawValue < HLO) {
+         dutyCycle = (short)((HLO - rawValue) * hsf);
+         direction = 1;  // Reverse direction
+    }
+    else if (rawValue > HHI) {
+         dutyCycle = (short)((rawValue - HHI) * hhsf);
+         direction = 0;  // Forward direction
+    }
+    
+    // Clamp the dutyCycle value to the range [0, 102]
+    if (dutyCycle < 0) dutyCycle = 0;
+    if (dutyCycle > 102) dutyCycle = 102;
+    
+    // Reset sleep timer if there is active input (non-zero dutyCycle)
+    if (dutyCycle != 0) {
+         sleepTimer = 0;
+    }
+    
+    // Transmit processed data over UART
+    char dataBuffer[30];
+    sprintf(dataBuffer, "DC:%d, DIR:%s\r\n", dutyCycle, (direction == 1) ? "REV" : "FWD");
+    UART_SendString(dataBuffer);
+}
+
+// -----------------------------------------------------------------
+// Battery Voltage Functions (using RA4, AN3)
+// -----------------------------------------------------------------
+unsigned int readBattery(void) {
+    // Battery on AN3 (assuming channel 3 corresponds to RA4)
+    ADCON0 = (BATTERY_ADC_CHANNEL << 2);
+    ADCON0bits.ADON = 1;
+    __delay_us(10);
+    ADCON0bits.GO_nDONE = 1;
+    while(ADCON0bits.GO_nDONE);
+    unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
+    return result;
+}
+
+void checkBattery(void) {
+    unsigned int adcVal = readBattery();
+    float voltage = adcVal * (3.3 / 1023.0);
+    char buffer[30];
+    sprintf(buffer, "Battery: %.2fV\r\n", voltage);
+    UART_SendString(buffer);
+    
+    // Use the power indicator LED on RC3 (pin 4) to indicate power status.
+    if (voltage >= 3.0)
+        POWER_LED_PIN = 1;   // Good power: LED on
+    else
+        POWER_LED_PIN = 0;   // Low power: LED off
 }
 
 // -----------------------------------------------------------------
@@ -254,34 +319,6 @@ void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int time
 }
 
 // -----------------------------------------------------------------
-// Battery Voltage Functions (using RA4, AN3)
-// -----------------------------------------------------------------
-unsigned int readBattery(void) {
-    // Battery on AN3 => RA4
-    ADCON0 = (BATTERY_ADC_CHANNEL << 2);
-    ADCON0bits.ADON = 1;
-    __delay_us(10);
-    ADCON0bits.GO_nDONE = 1;
-    while(ADCON0bits.GO_nDONE);
-    unsigned int result = ((unsigned int)ADRESH << 8) | ADRESL;
-    return result;
-}
-
-void checkBattery(void) {
-    unsigned int adcVal = readBattery();
-    float voltage = adcVal * (3.3 / 1023.0);
-    char buffer[30];
-    sprintf(buffer, "Battery: %.2fV\r\n", voltage);
-    UART_SendString(buffer);
-    
-    // Use the power indicator LED on RC3 (pin 4) to indicate power status.
-    if (voltage >= 3.0)
-        POWER_LED_PIN = 1;   // Good power: LED on
-    else
-        POWER_LED_PIN = 0;   // Low power: LED off
-}
-
-// -----------------------------------------------------------------
 // Timer0 Initialization and Interrupt Service Routine
 // -----------------------------------------------------------------
 void Timer0_Init(void) {
@@ -306,4 +343,3 @@ void __interrupt() isr(void) {
         sleepTimer++;
     }
 }
-
