@@ -23,34 +23,19 @@
 #define WAKE_HW_TRIS    TRISC6          // TRISC6 for WAKE_HW
 
 // -----------------------------------------------------------------
-// Motor Control (A3941 Full Bridge) Pin Definitions
+// Motor Control Pin Definitions
 // -----------------------------------------------------------------
-// Driver reset connection:
-//   - PIC pin 13 (RC0) -> driver reset (pin 24)
-#define DRIVER_RESET         LATC0    // PIC RC0 (pin 13)
-#define DRIVER_RESET_TRIS    TRISC0
-
-// PWM mapping for the full-bridge driver:
-//   - PIC PWM1 (assumed on RA0) -> driver’s PWMH (pin 23)
-//   - PIC PWM2 (assumed on RA1) -> driver’s PWML (pin 22)
+// We assume that the motor driver uses two PWM waves:
+//   - One for SR control (speed), mapped to PWMH_DUTY and PWML_DUTY
+//   - A separate phase control is handled via a dedicated output (PHASE_PIN)
 #define PWMH_DUTY    PWM1DCH
 #define PWML_DUTY    PWM2DCH
-#define PWMH_TRIS    TRISAbits.TRISA0   // PIC PWM1 output (RA0)
-#define PWML_TRIS    TRISAbits.TRISA1   // PIC PWM2 output (RA1)
+#define PWMH_TRIS    TRISAbits.TRISA0   // PWM output for forward drive
+#define PWML_TRIS    TRISAbits.TRISA1   // PWM output for reverse drive
 
-// -----------------------------------------------------------------
-// Phase Pin Definition for Driver
-// -----------------------------------------------------------------
-// The driver's Phase input is connected to PIC pin 12 (RC1). We need it always on.
+// Phase control (direction) output:
 #define PHASE_PIN      LATC1
 #define PHASE_TRIS     TRISC1
-
-// -----------------------------------------------------------------
-// Fault Flag Definitions
-// -----------------------------------------------------------------
-// Fault Flag 1 is connected to PIC RC4
-#define FAULT_FLAG1         PORTCbits.RC4
-#define FAULT_FLAG1_TRIS    TRISCbits.TRISC4
 
 // -----------------------------------------------------------------
 // Battery Voltage Monitoring
@@ -64,7 +49,6 @@
 // Switch on PIC pin 19 (assume RA5). Active low: 0 = pressed
 #define SWITCH_PIN          PORTAbits.RA5
 #define SWITCH_TRIS         TRISAbits.TRISA5
-
 // On-board pot on PIC pin 11 (assume RA2), configured as AN2
 #define LOCAL_POT_CHANNEL   2
 
@@ -78,8 +62,7 @@ void UART_SendString(const char* str);
 void WaitFor_RN4020_RTS(void);
 
 void Motor_Init(void);
-void setMotorSpeedDirection(unsigned char speed, unsigned char direction);
-void checkFaultFlag(void);
+void updateMotorSpeed(void);  // motor ramping function
 
 void ADC_Init(void);
 unsigned int readBattery(void);
@@ -90,6 +73,19 @@ void checkLocalPot(void);
 
 void processReceivedData(const char *data);
 
+// -----------------------------------------------------------------
+// Global variables for motor ramping
+// -----------------------------------------------------------------
+// tidc: target duty cycle (0..255)
+// rdc: running (current) duty cycle (0..255)
+// rdir: motor direction, 0 = forward, 1 = reverse
+volatile unsigned char tidc = 0;
+volatile unsigned char rdc = 0;
+volatile unsigned char rdir = 0;
+
+// -----------------------------------------------------------------
+// Main Function
+// -----------------------------------------------------------------
 void main(void) {
     // Initialize all subsystems
     UART_Init();    
@@ -99,34 +95,26 @@ void main(void) {
     // Configure the switch pin (RA5) as a digital input
     SWITCH_TRIS = 1;  
 
-    // Initially, hold the driver in reset.
-    DRIVER_RESET = 0;
-    __delay_ms(100); // time for proper reset
-
-    // Bring the driver out of reset
-    DRIVER_RESET = 1;
-
-    // Configure the Phase pin (connected to driver's Phase input) on RC1:
-    PHASE_TRIS = 0;  // Set RC1 as output
-    PHASE_PIN = 1;   // Drive RC1 high (Phase always on)
+    // Configure the phase pin (RC1) as output and set it high (assuming always on)
+    PHASE_TRIS = 0;
+    PHASE_PIN = 1; 
 
     __delay_ms(100);
     UART_SendString("$$$");  // Put RN4020 in command mode (example)
     __delay_ms(100);
 
-    // Example: initial motor setting (for testing, here using local pot signal)
-    setMotorSpeedDirection(128, 0); // 50% duty cycle, forward
+    // Optionally, send an initial message
+    UART_SendString("Receiver Ready\r\n");
 
+    // Main loop
     while (1) {
-        checkFaultFlag();
         checkBattery();
 
-        // If the test switch is pressed, use the on-board potentiometer
+        // If the test switch is pressed, use the on-board potentiometer for control
         if (SWITCH_PIN == 0) {
             checkLocalPot();
         } else {
-            // Otherwise, check for received data from the transmitter
-            // Use a non-blocking approach: if data is available, process it.
+            // Otherwise, if data is received from the transmitter, process it.
             if (RCIF) {
                 char receivedBuffer[50] = {0};
                 unsigned char idx = 0;
@@ -141,7 +129,10 @@ void main(void) {
             }
         }
 
-        __delay_ms(500);
+        // Update motor speed by ramping toward target duty cycle.
+        updateMotorSpeed();
+
+        __delay_ms(50);  // Adjust loop delay as needed
     }
 }
 
@@ -175,7 +166,7 @@ void UART_Init(void) {
 void WaitFor_RN4020_RTS(void) {
     // Wait until RN4020 indicates it's ready
     while (RN4020_RTS == 0) {
-        // Optional small delay
+        // Optionally add a short delay
     }
 }
 
@@ -200,50 +191,43 @@ void UART_SendString(const char* str) {
 // Motor Control Functions
 // -----------------------------------------------------------------
 void Motor_Init(void) {
-    // Driver reset pin (RC0)
-    DRIVER_RESET_TRIS = 0;
-    DRIVER_RESET = 0;
+    // Configure PWM outputs for motor speed control
+    PWMH_TRIS = 0;  // PWMH for forward drive
+    PWML_TRIS = 0;  // PWML for reverse drive
 
-    // PWM outputs
-    PWMH_TRIS = 0;
-    PWML_TRIS = 0;
-
-    // Zero duty cycles
+    // Initialize PWM duty cycles to zero
     PWMH_DUTY = 0;
     PWML_DUTY = 0;
-
-    // Fault flag pin
-    FAULT_FLAG1_TRIS = 1;
 }
 
-void setMotorSpeedDirection(unsigned char speed, unsigned char direction) {
-    // direction=0 => forward => drive PWMH, zero PWML
-    // direction=1 => reverse => drive PWML, zero PWMH
-    if (direction == 0) {
-        PWMH_DUTY = speed;
+// updateMotorSpeed() gradually changes the running duty cycle (rdc)
+// toward the target (tidc) using a fixed step. Then it updates the PWM outputs
+// based on the motor direction (rdir).
+void updateMotorSpeed(void) {
+    unsigned char step = 4; // ramp step (adjust for faster/slower ramping)
+
+    if (rdc < tidc) {
+        rdc += step;
+        if (rdc > tidc)
+            rdc = tidc;
+    } else if (rdc > tidc) {
+        if (rdc < step)
+            rdc = 0;
+        else
+            rdc -= step;
+        if (rdc < tidc)
+            rdc = tidc;
+    }
+    
+    // Update PWM outputs:
+    // For forward (rdir==0): drive PWMH_DUTY, zero PWML_DUTY.
+    // For reverse (rdir==1): drive PWML_DUTY, zero PWMH_DUTY.
+    if (rdir == 0) {
+        PWMH_DUTY = rdc;
         PWML_DUTY = 0;
     } else {
         PWMH_DUTY = 0;
-        PWML_DUTY = speed;
-    }
-}
-
-void checkFaultFlag(void) {
-    // Assume fault flag is active low
-    if (FAULT_FLAG1 == 0) {
-        // Fault => disable motor, reset driver
-        PWMH_DUTY = 0;
-        PWML_DUTY = 0;
-        DRIVER_RESET = 0;
-        UART_SendString("FAULT DETECTED\r\n");
-
-        // Wait for fault to clear
-        while (FAULT_FLAG1 == 0) {
-            __delay_ms(100);
-        }
-        // Restore driver
-        DRIVER_RESET = 1;
-        UART_SendString("FAULT CLEARED\r\n");
+        PWML_DUTY = rdc;
     }
 }
 
@@ -252,10 +236,10 @@ void checkFaultFlag(void) {
 // -----------------------------------------------------------------
 void ADC_Init(void) {
     // Enable analog on RA4 (for battery, AN3) and RA2 (for local pot, AN2)
-    // RA2 is bit 2 and RA4 is bit 4 => 0x14 = b00010100
+    // For example, RA2 is bit 2 and RA4 is bit 4 => 0x14 = b00010100
     ANSELA |= 0x14;
 
-    // Right justified, Fosc/32, Vref=VDD
+    // Configure ADC: right justified, Fosc/32, Vref = VDD.
     ADCON1 = 0xA0;
     ADCON2 = 0x00; // Manual trigger
 }
@@ -280,9 +264,10 @@ void checkBattery(void) {
 }
 
 // -----------------------------------------------------------------
-// Local Pot Reading (On-board pot on RA2 -> AN2)
+// Local Pot Reading Functions
 // -----------------------------------------------------------------
 unsigned int readLocalPot(void) {
+    // Local pot on AN2 => RA2
     ADCON0 = (LOCAL_POT_CHANNEL << 2);
     ADCON0bits.ADON = 1;
     __delay_us(10);
@@ -291,17 +276,15 @@ unsigned int readLocalPot(void) {
     return ((unsigned int)ADRESH << 8) | ADRESL;
 }
 
-// -----------------------------------------------------------------
-// Check Local Pot: Used when switch is pressed for testing
-// -----------------------------------------------------------------
+// checkLocalPot() reads the on-board potentiometer when the test switch is pressed.
+// It converts the 10-bit ADC reading (0-1023) to a value in the range 0-255 and sets
+// tidc (target duty cycle) accordingly. For local testing, we assume forward direction.
 void checkLocalPot(void) {
-    // Switch is active low => 0 means pressed
     if (SWITCH_PIN == 0) {
         unsigned int potVal = readLocalPot();
-        // Convert the 10-bit pot value (0..1023) to 0..255 for PWM duty cycle
         unsigned char speed = (unsigned char)(potVal >> 2);
-        // For local testing, we assume forward direction (direction = 0)
-        setMotorSpeedDirection(speed, 0);
+        tidc = speed;     // update target duty cycle
+        rdir = 0;         // assume forward direction for local testing
         char buf[30];
         sprintf(buf, "Local Pot: %u\r\n", speed);
         UART_SendString(buf);
@@ -311,19 +294,18 @@ void checkLocalPot(void) {
 // -----------------------------------------------------------------
 // Process Received Data from the Transmitter
 // -----------------------------------------------------------------
+// This function expects data in the format: "DC:<duty>, DIR:<dir>\r\n"
+// For example: "DC:45, DIR:FWD\r\n"
+// It parses the duty cycle and direction and updates tidc and rdir.
 void processReceivedData(const char *data) {
     int duty;
     char dirStr[4]; // to hold "FWD" or "REV"
     
-    // Expecting data in the format: "DC:<duty>, DIR:<dir>\r\n"
     if (sscanf(data, "DC:%d, DIR:%3s", &duty, dirStr) == 2) {
-        unsigned char directionVal = (strcmp(dirStr, "REV") == 0) ? 1 : 0;
-        // Optionally, map or clamp duty if needed before using it
-        setMotorSpeedDirection((unsigned char)duty, directionVal);
-        
-        // For debugging, print the parsed values
+        tidc = (unsigned char)duty;  // update target duty cycle
+        rdir = (strcmp(dirStr, "REV") == 0) ? 1 : 0;  // update direction
         char buf[50];
-        sprintf(buf, "Parsed: DC=%d, DIR=%s\r\n", duty, (directionVal==1 ? "REV" : "FWD"));
+        sprintf(buf, "Parsed: DC=%d, DIR=%s\r\n", duty, (rdir==1 ? "REV" : "FWD"));
         UART_SendString(buf);
     } else {
         UART_SendString("Invalid data received\r\n");
