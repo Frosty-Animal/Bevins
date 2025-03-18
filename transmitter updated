@@ -307,7 +307,3 @@ void __interrupt() isr(void) {
     }
 }
 
-// -----------------------------------------------------------------
-// (No checkLocalPot() function needed since pot is read continuously)
-// -----------------------------------------------------------------
-
