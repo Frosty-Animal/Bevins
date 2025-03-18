@@ -111,7 +111,7 @@ void main(void) {
     // Main loop
     while (1) {
         checkBattery();
-
+        checkFaultFlag()
         // If the test switch is pressed, use the on-board potentiometer for control
         if (SWITCH_PIN == 0) {
             checkLocalPot();
