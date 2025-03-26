@@ -2,6 +2,14 @@
 #include <stdio.h>
 #include <string.h>
 
+// Configuration bits must be at the top of the file
+#pragma config FOSC = INTOSC    // Internal oscillator
+#pragma config WDTE = OFF       // Watchdog Timer disabled
+#pragma config PWRTE = ON       // Power-up Timer enabled
+#pragma config MCLRE = OFF      // MCLR pin function is digital input
+#pragma config CP = OFF         // Program memory not protected
+#pragma config BOREN = ON       // Brown-out Reset enabled
+
 // Configuration: assume a 16MHz clock and 115200 baud UART
 #define _XTAL_FREQ 16000000
 #define BAUD_RATE 115200
@@ -12,6 +20,9 @@
 volatile unsigned int linkTimeout = 0;   // Refreshed when RN4020 responds
 volatile unsigned int sleepTimer = 0;      // Incremented in Timer0 ISR
 #define SLEEP_THRESHOLD 5000               // Example threshold (adjust as needed)
+unsigned int consecutiveFailures = 0;      // For tracking communication failures
+unsigned int statusRequestTimer = 0;       // Timer for requesting receiver status
+#define STATUS_REQUEST_INTERVAL 30         // Request status every 30 cycles
 
 // -----------------------------------------------------------------
 // UART and RN4020 Bluetooth Module Pin Definitions
@@ -60,6 +71,13 @@ volatile unsigned char direction = 0;     // 0 for forward, 1 for reverse
 #define BATTERY_ADC_CHANNEL 3
 
 // -----------------------------------------------------------------
+// Receiver Status Variables
+// -----------------------------------------------------------------
+float receiverBatteryVoltage = 0.0;    // Last reported receiver battery voltage
+int receiverDutyCycle = 0;             // Last reported receiver duty cycle
+char receiverDirection[4] = "FWD";     // Last reported receiver direction
+
+// -----------------------------------------------------------------
 // Function Prototypes
 // -----------------------------------------------------------------
 void UART_Init(void);
@@ -74,14 +92,14 @@ void checkBattery(void);
 void CheckPot(void);  // New function for processing potentiometer reading
 void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout);
 void Timer0_Init(void);
+void configureRN4020(void);
+void requestReceiverStatus(void);
 void __interrupt() isr(void);
 
 // -----------------------------------------------------------------
 // Main Function
 // -----------------------------------------------------------------
 void main(void) {
-    char response[30] = {0};
-
     // Initialize subsystems
     UART_Init();
     ADC_Init();
@@ -99,24 +117,10 @@ void main(void) {
     CTS_TRIS = 0;
     CTS_PIN = 1;         // Drive CTS high
 
-    __delay_ms(100);     // Allow RN4020 to power up
+    __delay_ms(500);     // Allow RN4020 to power up
 
-    // Enter command mode: send "$$$"
-    UART_SendString("$$$");
-    LED_Toggle();        // Toggle power LED to indicate command mode entry
-    __delay_ms(100);
-
-    // Optionally, read the response (expected "CMD")
-    RN4020_SendCommand("", response, 500);
-    // (Response check can be added if desired)
-
-    // Send a configuration command (example: set device name)
-    RN4020_SendCommand("SN,Transmitter", response, 500);
-    __delay_ms(100);
-
-    // Exit command mode (example command, see RN4020 datasheet)
-    RN4020_SendCommand("C", response, 500);
-    __delay_ms(100);
+    // Configure RN4020 Bluetooth module with comprehensive settings
+    configureRN4020();
 
     // Indicate transmitter is ready
     UART_SendString("Transmitter Ready\r\n");
@@ -124,21 +128,40 @@ void main(void) {
 
     // Refresh link indicator on startup
     linkTimeout = 50;
-    sleepTimer = 0; // Reset sleep timer
+    sleepTimer = 0;       // Reset sleep timer
+    statusRequestTimer = 0; // Reset status request timer
 
     while (1) {
         // Update link indicator:
         if (linkTimeout > 0) {
             LINK_LED_PIN = 1;   // Link active
+            consecutiveFailures = 0;
         } else {
             LINK_LED_PIN = 0;   // Link lost
+            
+            // Try to reestablish connection after several failures
+            consecutiveFailures++;
+            if (consecutiveFailures > 10) {
+                // Connection appears lost, try to reestablish
+                UART_SendString("$$$");  // Enter command mode
+                __delay_ms(100);
+                UART_SendString("C\r");  // Try to reconnect
+                __delay_ms(100);
+                consecutiveFailures = 0;
+            }
         }
         
-        // Instead of sending raw pot value, process it with CheckPot()
+        // Process potentiometer and send motor commands
         CheckPot();
         
         // Check battery voltage and update the power indicator LED
         checkBattery();
+        
+        // Periodically request status from the receiver
+        if (++statusRequestTimer >= STATUS_REQUEST_INTERVAL) {
+            requestReceiverStatus();
+            statusRequestTimer = 0;
+        }
         
         // If no activity occurs, sleepTimer will increment in the ISR.
         // If sleepTimer exceeds the threshold, put the MCU to sleep.
@@ -152,7 +175,93 @@ void main(void) {
             sleepTimer = 0;  // Reset sleep timer after waking up
         }
         
-        __delay_ms(500);
+        __delay_ms(100);  // Faster update rate for more responsive control
+    }
+}
+
+// -----------------------------------------------------------------
+// RN4020 Comprehensive Configuration
+// -----------------------------------------------------------------
+void configureRN4020(void) {
+    char response[30] = {0};
+    
+    // Enter command mode
+    UART_SendString("$$$");
+    __delay_ms(100);
+    
+    // Factory reset for clean configuration
+    RN4020_SendCommand("SF,1", response, 500);
+    __delay_ms(100);
+    
+    // Set device name
+    RN4020_SendCommand("SN,MWBevinRatchetTx", response, 500);
+    __delay_ms(100);
+    
+    // Configure services (matching receiver)
+    RN4020_SendCommand("SS,80800000", response, 500);
+    __delay_ms(100);
+    
+    // Configure the same Private Service UUID as the receiver
+    RN4020_SendCommand("PS,11223344556677889900AABBCCDDEEFF", response, 500);
+    __delay_ms(100);
+    
+    // Define private characteristic for motor control (matching receiver)
+    RN4020_SendCommand("PC,ABCD,0A,10", response, 500);
+    __delay_ms(100);
+    
+    // Define private characteristic for status reading
+    RN4020_SendCommand("PC,DCBA,12,20", response, 500);
+    __delay_ms(100);
+    
+    // Enable server services
+    RN4020_SendCommand("A", response, 500);
+    __delay_ms(100);
+    
+    // Set connection parameters:
+    // Min Interval = 10ms, Max Interval = 20ms, Latency = 0, Timeout = 1000ms
+    RN4020_SendCommand("SGA,6,C,0,64", response, 500);
+    __delay_ms(100);
+    
+    // Save settings and reboot to apply
+    RN4020_SendCommand("R,1", response, 500);
+    __delay_ms(1000);
+}
+
+// -----------------------------------------------------------------
+// Request and Process Receiver Status
+// -----------------------------------------------------------------
+void requestReceiverStatus(void) {
+    // Request status from receiver
+    UART_SendString("STAT?\r\n");
+    
+    // Wait for response
+    char response[50] = {0};
+    unsigned int timer = 0;
+    unsigned int idx = 0;
+    
+    while (timer < 300) { // 300ms timeout
+        if (RCIF) {
+            char ch = UART_Read();
+            response[idx++] = ch;
+            response[idx] = '\0';
+            if (ch == '\n') break;
+        }
+        __delay_ms(1);
+        timer++;
+    }
+    
+    // Process receiver status if received
+    if (strncmp(response, "STAT:", 5) == 0) {
+        if (sscanf(response + 5, "%d,%3s,%fV", &receiverDutyCycle, receiverDirection, &receiverBatteryVoltage) >= 2) {
+            // Update link timeout since we received valid data
+            linkTimeout = 50;
+            
+            // Optionally use these values for display or diagnostics
+            char debugBuffer[50];
+            sprintf(debugBuffer, "Receiver: %d, %s, %.1fV\r\n", 
+                    receiverDutyCycle, receiverDirection, receiverBatteryVoltage);
+            UART_SendString(debugBuffer);
+        }
     }
 }
 
@@ -187,6 +296,7 @@ void WaitFor_RN4020_RTS(void) {
     // Wait until RN4020's RTS (RB6) indicates readiness (active high)
     while (RN4020_RTS == 0) {
         // Optionally add a short delay here
+        __delay_us(10);  // Added short delay to prevent tight loop
     }
 }
 
@@ -252,15 +362,13 @@ void CheckPot(void) {
     // Clamp the dutyCycle value to the range [0, 102]
     if (dutyCycle < 0) dutyCycle = 0;
     if (dutyCycle > 102) dutyCycle = 102;
-    
-    // Reset sleep timer if there is active input (non-zero dutyCycle)
-    if (dutyCycle != 0) {
+     if (dutyCycle != 0) {
          sleepTimer = 0;
     }
     
-    // Transmit processed data over UART
+    // Transmit processed data with MTR: prefix to match the receiver's expected format
     char dataBuffer[30];
-    sprintf(dataBuffer, "DC:%d, DIR:%s\r\n", dutyCycle, (direction == 1) ? "REV" : "FWD");
+    sprintf(dataBuffer, "MTR:%d,%s\r\n", dutyCycle, (direction == 1) ? "REV" : "FWD");
     UART_SendString(dataBuffer);
 }
 
@@ -281,15 +389,23 @@ unsigned int readBattery(void) {
 void checkBattery(void) {
     unsigned int adcVal = readBattery();
     float voltage = adcVal * (3.3 / 1023.0);
+    
+    // Store battery voltage in a buffer
     char buffer[30];
     sprintf(buffer, "Battery: %.2fV\r\n", voltage);
-    UART_SendString(buffer);
+    
+    // Only send battery information occasionally to reduce traffic
+    static unsigned char batteryReportCounter = 0;
+    if (++batteryReportCounter >= 20) {  // Report every 20 cycles
+        UART_SendString(buffer);
+        batteryReportCounter = 0;
+    }
     
     // Use the power indicator LED on RC3 (pin 4) to indicate power status.
     if (voltage >= 3.0)
         POWER_LED_PIN = 1;   // Good power: LED on
     else
-        POWER_LED_PIN = 0;   // Low power: LED off
+        POWER_LED_PIN = 0;   // Low power: LED off or blink to indicate warning
 }
 
 // -----------------------------------------------------------------
