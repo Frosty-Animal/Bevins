@@ -300,19 +300,53 @@ void checkLocalPot(void) {
 // For example: "DC:45, DIR:FWD\r\n"
 // It parses the duty cycle and direction and updates tidc and rdir.
 void processReceivedData(const char *data) {
-    int duty;
-    char dirStr[4]; // to hold "FWD" or "REV"
-    
-    if (sscanf(data, "DC:%d, DIR:%3s", &duty, dirStr) == 2) {
-        tidc = (unsigned char)duty;  // update target duty cycle
-        rdir = (strcmp(dirStr, "REV") == 0) ? 1 : 0;  // update direction
-        char buf[50];
-        sprintf(buf, "Parsed: DC=%d, DIR=%s\r\n", duty, (rdir==1 ? "REV" : "FWD"));
-        UART_SendString(buf);
-    } else {
-        UART_SendString("Invalid data received\r\n");
+    // Check for command type
+    if (strncmp(data, "MTR:", 4) == 0) {
+        // Motor command
+        int duty;
+        char direction[4];
+        
+        if (sscanf(data + 4, "%d,%3s", &duty, direction) == 2) {
+            // Validate duty cycle range
+            if (duty >= 0 && duty <= 255) {
+                tidc = (unsigned char)duty;
+                
+                // Set direction
+                if (strcmp(direction, "FWD") == 0) {
+                    rdir = 0;
+                } else if (strcmp(direction, "REV") == 0) {
+                    rdir = 1;
+                } else {
+                    UART_SendString("ERR:INVALID_DIR\r\n");
+                    return;
+                }
+                
+                // Acknowledge
+                char response[30];
+                sprintf(response, "ACK:MTR,%d,%s\r\n", tidc, rdir ? "REV" : "FWD");
+                UART_SendString(response);
+            } else {
+                UART_SendString("ERR:DUTY_RANGE\r\n");
+            }
+        } else {
+            UART_SendString("ERR:FORMAT\r\n");
+        }
+    } 
+    else if (strncmp(data, "STAT?", 5) == 0) {
+        // Status request
+        char status[50];
+        unsigned int batteryADC = readBattery();
+        float voltage = batteryADC * (3.3 / 1023.0);
+        
+        sprintf(status, "STAT:%d,%s,%.1fV\r\n", 
+                rdc, rdir ? "REV" : "FWD", voltage);
+        UART_SendString(status);
+    }
+    else {
+        UART_SendString("ERR:UNKNOWN_CMD\r\n");
     }
 }
+
 
 // Error handling function for motor driver faults
 void checkFaultFlag(void) {
