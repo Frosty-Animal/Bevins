@@ -23,7 +23,12 @@
 #define WAKE_HW_TRIS    TRISC6          // TRISC6 for WAKE_HW
 #define FAULT_FLAG         PORTCbits.RC4
 #define FAULT_FLAG_TRIS    TRISCbits.TRISC4
-
+#pragma config FOSC = INTOSC    // Internal oscillator
+#pragma config WDTE = OFF       // Watchdog Timer disabled
+#pragma config PWRTE = ON       // Power-up Timer enabled
+#pragma config MCLRE = OFF      // MCLR pin function is digital input
+#pragma config CP = OFF         // Program memory not protected
+#pragma config BOREN = ON       // Brown-out Reset enabled
 // -----------------------------------------------------------------
 // Motor Control Pin Definitions
 // -----------------------------------------------------------------
@@ -349,18 +354,45 @@ void processReceivedData(const char *data) {
 
 
 // Error handling function for motor driver faults
+void PWM_Init(void) {
+    // Configure Timer2 for PWM operation
+    PR2 = 101;           // Period value for ~19.6 kHz with 16MHz clock
+    T2CON = 0x00;        // Prescaler = 1, timer off initially
+    
+    // Configure PWM modules
+    CCP1CON = 0x0C;      // PWM mode for CCP1
+    CCP2CON = 0x0C;      // PWM mode for CCP2
+    
+    // Start Timer2
+    TMR2IF = 0;
+    TMR2 = 0;
+    TMR2ON = 1;          // Turn on Timer2
+    
+    // Wait for Timer2 to overflow once
+    while (!TMR2IF);
+    
+    // Initialize PWM duty cycles to 0
+    PWMH_DUTY = 0;
+    PWML_DUTY = 0;
+}
+
+// Define the missing fault check function
 void checkFaultFlag(void) {
-    // Assume the fault flag is active low
+    // Check if fault pin is active (active low)
     if (FAULT_FLAG == 0) {
         // Disable motor outputs
         PWMH_DUTY = 0;
         PWML_DUTY = 0;
-        UART_SendString("Motor fault detected\r\n");
-
-        // Optionally, disable further control or reset the driver
-        // You might also want to wait until the fault clears:
+        
+        // Notify about fault
+        UART_SendString("FAULT:DETECTED\r\n");
+        
+        // Wait for fault to clear
         while (FAULT_FLAG == 0) {
             __delay_ms(100);
         }
-        UART_SendString("Motor fault cleared\r\n");
+        
+        // Notify fault cleared
+        UART_SendString("FAULT:CLEARED\r\n");
     }
+}
