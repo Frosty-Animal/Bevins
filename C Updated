@@ -1,6 +1,14 @@
+/*
+ * File:   newmain.c
+ * Author: ihajabo
+ *
+ * Created on May 14, 2025, 9:24 AM
+ */
+
 #include <xc.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 // Configuration bits must be at the top of the file
 #pragma config FOSC = INTOSC    // Internal oscillator
@@ -104,7 +112,7 @@ unsigned char batteryCheckCounter = 0;
 // -----------------------------------------------------------------
 // Main Function
 // -----------------------------------------------------------------
-void main(void) {
+void newmain(void) {
     // Initialize all subsystems
     UART_Init();    
     Motor_Init();   
@@ -265,7 +273,7 @@ void UART_SendString(const char* str) {
         UART_Write(*str++);
     }
 }
-
+/*
 // -----------------------------------------------------------------
 // PWM Initialization
 // -----------------------------------------------------------------
@@ -290,22 +298,20 @@ void PWM_Init(void) {
     PWMH_DUTY = 0;
     PWML_DUTY = 0;
 }
-
+*/
 // -----------------------------------------------------------------
 // Motor Control Functions
 // -----------------------------------------------------------------
 void Motor_Init(void) {
-    // Configure PWM outputs for motor speed control
+    // Configure PWM output pins as outputs
+    // Note: MCC may have already set these in pin_manager.c
+    // But it's safe to ensure they're outputs
     PWMH_TRIS = 0;  // PWMH for forward drive
     PWML_TRIS = 0;  // PWML for reverse drive
-
-    // Initialize PWM hardware - Call PWM_Init to properly configure timer and PWM modules
-    PWM_Init();
+    
+    // MCC has already initialized the PWM modules and Timer2
+    // So no PWM_Init() call needed
 }
-
-// updateMotorSpeed() gradually changes the running duty cycle (rdc)
-// toward the target (tidc) using a fixed step. Then it updates the PWM outputs
-// based on the motor direction (rdir).
 void updateMotorSpeed(void) {
     unsigned char step = 4; // ramp step (adjust for faster/slower ramping)
 
