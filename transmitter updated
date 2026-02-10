@@ -1,14 +1,31 @@
+/*
+ * File:   newmain.c
+ * Author: ihajabo
+ *
+ * Created on May 14, 2025, 9:24 AM
+ */
+
 #include <xc.h>
 #include <stdio.h>
 #include <string.h>
 
 // Configuration bits must be at the top of the file
+// Configuration bits for PIC16F1509
+// CONFIG1
 #pragma config FOSC = INTOSC    // Internal oscillator
 #pragma config WDTE = OFF       // Watchdog Timer disabled
 #pragma config PWRTE = ON       // Power-up Timer enabled
-#pragma config MCLRE = OFF      // MCLR pin function is digital input
+#pragma config MCLRE = ON       // MCLR pin function is MCLR (required for programming)
 #pragma config CP = OFF         // Program memory not protected
 #pragma config BOREN = ON       // Brown-out Reset enabled
+#pragma config CLKOUTEN = OFF   // CLKOUT function disabled
+
+// CONFIG2
+#pragma config WRT = OFF        // Flash memory write protection off
+#pragma config STVREN = ON      // Stack overflow reset enabled
+#pragma config BORV = LO        // Brown-out Reset voltage (low trip point)
+#pragma config LPBOR = OFF      // Low-Power BOR disabled
+#pragma config LVP = OFF        // Low-voltage programming disabled
 
 // Configuration: assume a 16MHz clock and 115200 baud UART
 #define _XTAL_FREQ 16000000
@@ -23,7 +40,8 @@ volatile unsigned int sleepTimer = 0;      // Incremented in Timer0 ISR
 unsigned int consecutiveFailures = 0;      // For tracking communication failures
 unsigned int statusRequestTimer = 0;       // Timer for requesting receiver status
 #define STATUS_REQUEST_INTERVAL 30         // Request status every 30 cycles
-
+char sharedBuffer[30] = {0};
+unsigned char linkLedBlinkCounter = 0;
 // -----------------------------------------------------------------
 // UART and RN4020 Bluetooth Module Pin Definitions
 // -----------------------------------------------------------------
@@ -52,7 +70,6 @@ unsigned int statusRequestTimer = 0;       // Timer for requesting receiver stat
 // LED control functions (for power/status LED)
 void LED_On(void) { POWER_LED_PIN = 1; }
 void LED_Off(void) { POWER_LED_PIN = 0; }
-void LED_Toggle(void) { POWER_LED_PIN = !POWER_LED_PIN; }
 
 // -----------------------------------------------------------------
 // Potentiometer Processing Definitions (for deadband and scaling)
@@ -100,11 +117,13 @@ void __interrupt() isr(void);
 // Main Function
 // -----------------------------------------------------------------
 void main(void) {
+    OSCCON = 0b01111010;
+    while (!OSCSTATbits.HFIOFS);
+    
     // Initialize subsystems
     UART_Init();
     ADC_Init();
-    Timer0_Init();  // Initialize Timer0 for periodic interrupts
-
+    Timer0_Init();
     // Configure LED outputs:
     POWER_LED_TRIS = 0;   // Power indicator LED (RC3) as output
     LED_Off();            // Start with power LED off
@@ -132,101 +151,100 @@ void main(void) {
     statusRequestTimer = 0; // Reset status request timer
 
     while (1) {
-        // Update link indicator:
-        if (linkTimeout > 0) {
-            LINK_LED_PIN = 1;   // Link active
+    // Update link indicator LED behavior:
+    if (linkTimeout > 0) {
+        // Connected - keep link LED solid ON
+        LINK_LED_PIN = 1;
+        consecutiveFailures = 0;
+        linkLedBlinkCounter = 0;  // Reset blink counter
+    } else {
+        // Not connected - BLINK the link LED at controlled rate
+        linkLedBlinkCounter++;
+        if (linkLedBlinkCounter >= 5) {  // Toggle every 5 loops (500ms with 100ms delay)
+            LINK_LED_PIN = !LINK_LED_PIN;
+            linkLedBlinkCounter = 0;
+        }
+        
+        // Try to reestablish connection after several failures
+        consecutiveFailures++;
+        if (consecutiveFailures > 10) {
+            UART_SendString("$$$");
+            __delay_ms(100);
+            UART_SendString("C\r");
+            __delay_ms(100);
             consecutiveFailures = 0;
-        } else {
-            LINK_LED_PIN = 0;   // Link lost
-            
-            // Try to reestablish connection after several failures
-            consecutiveFailures++;
-            if (consecutiveFailures > 10) {
-                // Connection appears lost, try to reestablish
-                UART_SendString("$$$");  // Enter command mode
-                __delay_ms(100);
-                UART_SendString("C\r");  // Try to reconnect
-                __delay_ms(100);
-                consecutiveFailures = 0;
-            }
         }
-        
-        // Process potentiometer and send motor commands
-        CheckPot();
-        
-        // Check battery voltage and update the power indicator LED
-        checkBattery();
-        
-        // Periodically request status from the receiver
-        if (++statusRequestTimer >= STATUS_REQUEST_INTERVAL) {
-            requestReceiverStatus();
-            statusRequestTimer = 0;
-        }
-        
-        // If no activity occurs, sleepTimer will increment in the ISR.
-        // If sleepTimer exceeds the threshold, put the MCU to sleep.
-        if (sleepTimer >= SLEEP_THRESHOLD) {
-            // Before sleeping, disable interrupts
-            di();  // Disable global interrupts (or use INTCONbits.GIE = 0;)
-            // Optionally, turn off peripherals here
-            SLEEP();  // Enter low-power sleep mode
-            // MCU wakes up on an interrupt (e.g., Timer0)
-            ei();  // Enable global interrupts (or use INTCONbits.GIE = 1;)
-            sleepTimer = 0;  // Reset sleep timer after waking up
-        }
-        
-        __delay_ms(100);  // Faster update rate for more responsive control
     }
+    
+    // Process potentiometer and send motor commands
+    CheckPot();
+    
+    // Check battery voltage and update the POWER indicator LED
+    checkBattery();
+    
+    // Periodically request status from the receiver
+    if (++statusRequestTimer >= STATUS_REQUEST_INTERVAL) {
+        requestReceiverStatus();
+        statusRequestTimer = 0;
+    }
+    
+    // Sleep logic
+    if (sleepTimer >= SLEEP_THRESHOLD) {
+        INTCONbits.GIE = 0;  // Disable global interrupts
+        SLEEP();             // Enter sleep mode
+        NOP();               // Required after SLEEP instruction
+        INTCONbits.GIE = 1;  // Re-enable interrupts after wakeup
+        sleepTimer = 0;
+}
+    
+    __delay_ms(100);
+}
 }
 
 // -----------------------------------------------------------------
 // RN4020 Comprehensive Configuration
 // -----------------------------------------------------------------
 void configureRN4020(void) {
-    char response[30] = {0};
-    
     // Enter command mode
     UART_SendString("$$$");
     __delay_ms(100);
     
-    // Factory reset for clean configuration
-    RN4020_SendCommand("SF,1", response, 500);
-    __delay_ms(100);
+    // Factory reset
+    UART_SendString("SF,1\r");
+    __delay_ms(500);
     
     // Set device name
-    RN4020_SendCommand("SN,MWBevinRatchetTx", response, 500);
+    UART_SendString("SN,MWBevinRatchetTx\r");
     __delay_ms(100);
     
-    // Configure services (matching receiver)
-    RN4020_SendCommand("SS,80800000", response, 500);
+    // Configure services
+    UART_SendString("SS,80800000\r");
     __delay_ms(100);
     
-    // Configure the same Private Service UUID as the receiver
-    RN4020_SendCommand("PS,11223344556677889900AABBCCDDEEFF", response, 500);
+    // Configure Private Service UUID
+    UART_SendString("PS,11223344556677889900AABBCCDDEEFF\r");
     __delay_ms(100);
     
-    // Define private characteristic for motor control (matching receiver)
-    RN4020_SendCommand("PC,ABCD,0A,10", response, 500);
+    // Define private characteristic for motor control
+    UART_SendString("PC,ABCD,0A,10\r");
     __delay_ms(100);
     
-    // Define private characteristic for status reading
-    RN4020_SendCommand("PC,DCBA,12,20", response, 500);
+    // Define private characteristic for status
+    UART_SendString("PC,DCBA,12,20\r");
     __delay_ms(100);
     
     // Enable server services
-    RN4020_SendCommand("A", response, 500);
+    UART_SendString("A\r");
     __delay_ms(100);
     
-    // Set connection parameters:
-    // Min Interval = 10ms, Max Interval = 20ms, Latency = 0, Timeout = 1000ms
-    RN4020_SendCommand("SGA,6,C,0,64", response, 500);
+    // Set connection parameters
+    UART_SendString("SGA,6,C,0,64\r");
     __delay_ms(100);
     
-    // Save settings and reboot to apply
-    RN4020_SendCommand("R,1", response, 500);
+    // Save and reboot
+    UART_SendString("R,1\r");
     __delay_ms(1000);
 }
-
 // -----------------------------------------------------------------
 // Request and Process Receiver Status
 // -----------------------------------------------------------------
@@ -235,33 +253,25 @@ void requestReceiverStatus(void) {
     UART_SendString("STAT?\r\n");
     
     // Wait for response
-    char response[50] = {0};
     unsigned int timer = 0;
     unsigned int idx = 0;
+    sharedBuffer[0] = '\0';
     
-    while (timer < 300) { // 300ms timeout
+    while (timer < 300) {
         if (RCIF) {
             char ch = UART_Read();
-            response[idx++] = ch;
-            response[idx] = '\0';
-            if (ch == '\n') break;
+            sharedBuffer[idx++] = ch;
+            sharedBuffer[idx] = '\0';
+            if (ch == '\n' || idx >= 29) break;
         }
         __delay_ms(1);
         timer++;
     }
     
-    // Process receiver status if received
-    if (strncmp(response, "STAT:", 5) == 0) {
-        if (sscanf(response + 5, "%d,%3s,%fV", &receiverDutyCycle, receiverDirection, &receiverBatteryVoltage) >= 2) {
-            // Update link timeout since we received valid data
-            linkTimeout = 50;
-            
-            // Optionally use these values for display or diagnostics
-            char debugBuffer[50];
-            sprintf(debugBuffer, "Receiver: %d, %s, %.1fV\r\n", 
-                    receiverDutyCycle, receiverDirection, receiverBatteryVoltage);
-            UART_SendString(debugBuffer);
-        }
+    // Simple check - if we got "STAT:" response, link is active
+    if (strncmp(sharedBuffer, "STAT:", 5) == 0) {
+        linkTimeout = 50;
+        UART_SendString("RX:OK\r\n");
     }
 }
 
@@ -321,13 +331,12 @@ void UART_SendString(const char* str) {
 // ADC Functions for Local Potentiometer (AN2 on RA2, pin 14)
 // -----------------------------------------------------------------
 void ADC_Init(void) {
-    // Enable analog function on RA2 (bit 2 of ANSELA) for the local potentiometer
-    ANSELA |= 0x04;  // 0x04 sets AN2 as analog
-    // Enable analog function on RA4 (bit 4 of ANSELA) for battery (AN3)
-    ANSELA |= 0x10;  // 0x10 sets AN4 as analog (adjust if needed for AN3)
-    // Configure ADC: right justified, Fosc/32, Vref = VDD.
-    ADCON1 = 0xA0;
-    ADCON2 = 0x00; // Manual trigger
+    ANSELA |= 0x04;  // AN2 for potentiometer
+    ANSELA |= 0x08;  // AN3 for battery (RA4)
+    
+    ADCON1bits.ADFM = 1;
+    ADCON1bits.ADCS = 0b010;
+    ADCON1bits.ADPREF = 0b00;
 }
 
 unsigned int readLocalPot(void) {
@@ -345,32 +354,42 @@ unsigned int readLocalPot(void) {
 // CheckPot: Process the potentiometer reading with deadband and scaling
 // -----------------------------------------------------------------
 void CheckPot(void) {
-    unsigned int rawValue = readLocalPot();  // Read raw ADC value (0-1023)
+    unsigned int rawValue = readLocalPot();
     
     if ((rawValue >= HLO) && (rawValue <= HHI)) {
-         dutyCycle = 0;  // Within deadband: no movement
+         dutyCycle = 0;
     }
     else if (rawValue < HLO) {
          dutyCycle = (short)((HLO - rawValue) * hsf);
-         direction = 1;  // Reverse direction
+         direction = 1;
     }
     else if (rawValue > HHI) {
          dutyCycle = (short)((rawValue - HHI) * hhsf);
-         direction = 0;  // Forward direction
+         direction = 0;
     }
     
-    // Clamp the dutyCycle value to the range [0, 102]
     if (dutyCycle < 0) dutyCycle = 0;
     if (dutyCycle > 102) dutyCycle = 102;
-     if (dutyCycle != 0) {
+    if (dutyCycle != 0) {
          sleepTimer = 0;
     }
     
-    // Transmit processed data with MTR: prefix to match the receiver's expected format
-    char dataBuffer[30];
-    sprintf(dataBuffer, "MTR:%d,%s\r\n", dutyCycle, (direction == 1) ? "REV" : "FWD");
-    UART_SendString(dataBuffer);
+    // Send motor command without sprintf - build string manually
+    UART_SendString("MTR:");
+    
+    // Send duty cycle as string
+    if (dutyCycle >= 100) UART_Write('0' + (char)(dutyCycle / 100));
+    if (dutyCycle >= 10) UART_Write('0' + (char)((dutyCycle / 10) % 10));
+    UART_Write('0' + (char)(dutyCycle % 10));
+    
+    // Send direction
+    if (direction == 1) {
+        UART_SendString(",REV\r\n");
+    } else {
+        UART_SendString(",FWD\r\n");
+    }
 }
+
 
 // -----------------------------------------------------------------
 // Battery Voltage Functions (using RA4, AN3)
@@ -390,60 +409,35 @@ void checkBattery(void) {
     unsigned int adcVal = readBattery();
     float voltage = adcVal * (3.3 / 1023.0);
     
-    // Store battery voltage in a buffer
-    char buffer[30];
-    sprintf(buffer, "Battery: %.2fV\r\n", voltage);
-    
-    // Only send battery information occasionally to reduce traffic
     static unsigned char batteryReportCounter = 0;
-    if (++batteryReportCounter >= 20) {  // Report every 20 cycles
-        UART_SendString(buffer);
+    if (++batteryReportCounter >= 20) {
+        // Simple battery status without sprintf
+        if (voltage >= 3.0) {
+            UART_SendString("BAT:OK\r\n");
+        } else {
+            UART_SendString("BAT:LOW\r\n");
+        }
         batteryReportCounter = 0;
     }
     
-    // Use the power indicator LED on RC3 (pin 4) to indicate power status.
     if (voltage >= 3.0)
-        POWER_LED_PIN = 1;   // Good power: LED on
+        POWER_LED_PIN = 1;
     else
-        POWER_LED_PIN = 0;   // Low power: LED off or blink to indicate warning
-}
-
-// -----------------------------------------------------------------
-// RN4020 Command Function
-// -----------------------------------------------------------------
-void RN4020_SendCommand(const char* cmd, char* responseBuffer, unsigned int timeout) {
-    if (strlen(cmd) > 0) {
-        UART_SendString(cmd);
-        UART_Write('\r');
-    }
-    unsigned int timer = 0;
-    unsigned int idx = 0;
-    responseBuffer[0] = '\0';  // Clear response buffer
-    while (timer < timeout) {
-        if (RCIF) {
-            char ch = UART_Read();
-            responseBuffer[idx++] = ch;
-            responseBuffer[idx] = '\0';
-            if (ch == '\n') break;  // End of response
-        }
-        __delay_ms(1);
-        timer++;
-    }
-    if (strlen(responseBuffer) > 0) {
-        linkTimeout = 50;  // Refresh link indicator timeout if response received
-    }
+        POWER_LED_PIN = 0;
 }
 
 // -----------------------------------------------------------------
 // Timer0 Initialization and Interrupt Service Routine
 // -----------------------------------------------------------------
 void Timer0_Init(void) {
-    // Configure Timer0 for periodic interrupts
-    // OPTION_REG: Prescaler set to 256 (adjust as needed)
-    OPTION_REG = 0x07;  // PS bits = 111 (1:256), T0CS = 0 (Fosc/4 clock)
-    TMR0 = 0;           // Initial timer value (adjust if a specific interval is needed)
-    TMR0IF = 0;         // Clear Timer0 interrupt flag
-    TMR0IE = 1;         // Enable Timer0 interrupt
+    OPTION_REG = 0x07;
+    TMR0 = 0;
+    TMR0IF = 0;
+    TMR0IE = 1;
+    
+    // Enable interrupts
+    INTCONbits.PEIE = 1;
+    INTCONbits.GIE = 1;
 }
 
 void __interrupt() isr(void) {
